@@ -27,7 +27,7 @@ services:
 
   nginx:
     container_name: bilinote-nginx
-    image: nginx:1.25-alpine
+    image: m.daocloud.io/docker.io/library/nginx:1.25-alpine
     ports:
       - "${APP_BIND_HOST:-127.0.0.1}:${APP_PORT}:80"
     volumes:

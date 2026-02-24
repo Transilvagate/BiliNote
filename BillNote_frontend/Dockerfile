@@ -1,5 +1,8 @@
 # === 前端构建阶段 ===
-FROM node:20-slim AS builder
+ARG NODE_BASE_IMAGE=m.daocloud.io/docker.io/library/node:20-slim
+ARG NGINX_BASE_IMAGE=m.daocloud.io/docker.io/library/nginx:1.25-alpine
+
+FROM ${NODE_BASE_IMAGE} AS builder
 
 # 使用 pnpm v9，规避 pnpm v10 在容器内默认拦截依赖构建脚本导致的构建失败
 RUN corepack enable && corepack prepare pnpm@9.15.5 --activate
@@ -14,7 +17,7 @@ COPY ./BillNote_frontend /app
 RUN pnpm install --no-frozen-lockfile && pnpm run build
 
 # --- 阶段2：使用 nginx 作为静态服务器 ---
-FROM nginx:1.25-alpine
+FROM ${NGINX_BASE_IMAGE}
 
 # 删除默认配置（可选）
 RUN rm -rf /etc/nginx/conf.d/default.conf
