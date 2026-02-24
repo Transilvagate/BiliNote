@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM m.daocloud.io/docker.io/library/python:3.11-slim
 
 ARG BBDOWN_VERSION=1.6.3
 ARG BBDOWN_DOWNLOAD_URL=https://github.com/nilaoda/BBDown/releases/download/1.6.3/BBDown_1.6.3_20240814_linux-x64.zip
