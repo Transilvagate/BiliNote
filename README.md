@@ -13,6 +13,7 @@
   <img src="https://img.shields.io/badge/frontend-react-blue" />
   <img src="https://img.shields.io/badge/backend-fastapi-green" />
   <img src="https://img.shields.io/badge/docker-compose-blue" />
+  <img src="https://img.shields.io/badge/CUDA-12.8-76B900?logo=nvidia" />
 </p>
 
 ---
@@ -160,6 +161,8 @@ data/notes/
 
 ### 使用 Docker 部署（推荐）
 
+**CPU 版（默认）**
+
 ```bash
 git clone https://github.com/Transilvagate/BiliNote.git
 cd BiliNote
@@ -168,6 +171,30 @@ cp .env.example .env
 # 编辑 .env 配置端口等参数
 docker compose up -d
 ```
+
+**GPU 版（NVIDIA，推荐用于本地转写加速）**
+
+前提：已安装 NVIDIA Windows 驱动（WSL2 环境）或 Linux 原生驱动，且 Docker Desktop / Docker Engine 已启用 GPU 支持。
+
+```bash
+cp .env.example .env
+# 编辑 .env，设置转写模型（GPU 下推荐 large-v3-turbo）：
+# TRANSCRIBER_TYPE=fast-whisper
+# WHISPER_MODEL_SIZE=large-v3-turbo
+
+docker compose -f docker-compose.gpu.yml up -d
+```
+
+验证 GPU 是否生效：
+
+```bash
+docker exec bilinote-backend python3 -c "
+import ctranslate2
+print('CUDA 设备数:', ctranslate2.get_cuda_device_count())
+"
+```
+
+> **注意（RTX 50xx / Blackwell 架构）**：`Dockerfile.gpu` 使用 `nvidia/cuda:12.8.0` 基础镜像，支持 RTX 5060 及以上 Blackwell GPU。RTX 40xx 及更早架构同样兼容。
 
 ### 手动部署
 
@@ -206,7 +233,10 @@ docker compose exec -it backend BBDown login
 - **BBDown** v1.6.3 — B 站字幕下载（Docker 镜像已内置，手动部署需自行安装）
   - 项目地址：https://github.com/nilaoda/BBDown
   - 许可证：MIT
-- **fast-whisper** — 本地音频转写（可选，支持 CUDA 加速）
+- **faster-whisper** — 本地音频转写（可选）
+  - CPU 模式：使用 `int8` 量化，无需 GPU
+  - GPU 模式：使用 `float16` 推理，需 NVIDIA GPU + CUDA 12.8+（GPU 版 Docker 镜像已内置）
+  - 推荐模型：`large-v3-turbo`（显存约 3GB，中文准确率高，速度快）
 
 ---
 
