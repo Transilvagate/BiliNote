@@ -63,10 +63,12 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
   const loadProviderById = useProviderStore(state => state.loadProviderById)
   const updateProvider = useProviderStore(state => state.updateProvider)
   const addNewProvider = useProviderStore(state => state.addNewProvider)
+  const deleteProvider = useProviderStore(state => state.deleteProvider)
   const [loading, setLoading] = useState(true)
   const [testing, setTesting] = useState(false)
   const [isBuiltIn, setIsBuiltIn] = useState(false)
   const loadModelsById= useModelStore(state => state.loadModelsById)
+  const loadEnabledModels = useModelStore(state => state.loadEnabledModels)
   const [modelOptions, setModelOptions] = useState<IModel[]>([]) // ⚡新增，保存模型列表
   const [models, setModels]= useState([])
   const [modelLoading, setModelLoading] = useState(false)
@@ -209,6 +211,23 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
     await loadModelsById(id!)
   }
 
+  const handleDeleteProvider = async () => {
+    if (!id) {
+      toast.error('供应商不存在')
+      return
+    }
+    if (!window.confirm('确定删除该模型供应商及其关联模型吗？')) return
+
+    try {
+      await deleteProvider(id)
+      await loadEnabledModels()
+      toast.success('模型供应商已删除')
+      navigate('/settings/model')
+    } catch (error) {
+      toast.error('删除模型供应商失败')
+    }
+  }
+
   if (loading) return <div className="p-4">加载中...</div>
 
   return (
@@ -283,9 +302,16 @@ const ProviderForm = ({ isCreate = false }: { isCreate?: boolean }) => {
             )}
           />
           <div className="pt-2">
-            <Button type="submit" disabled={!providerForm.formState.isDirty}>
-              {isEditMode ? '保存修改' : '保存创建'}
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button type="submit" disabled={!providerForm.formState.isDirty}>
+                {isEditMode ? '保存修改' : '保存创建'}
+              </Button>
+              {isEditMode && (
+                <Button type="button" variant="destructive" onClick={handleDeleteProvider}>
+                  删除供应商
+                </Button>
+              )}
+            </div>
           </div>
         </form>
       </Form>

@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import threading
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,6 +73,11 @@ STATUS_EVENTS_LIMIT = 30
 FORMAL_TRANSCRIPT_OUTPUT_RESERVE = int(os.getenv("FORMAL_TRANSCRIPT_OUTPUT_RESERVE", "4000"))
 FORMAL_TRANSCRIPT_CHUNK_TARGET = int(os.getenv("FORMAL_TRANSCRIPT_CHUNK_TARGET", "6000"))
 FORMAL_TRANSCRIPT_MERGE_TARGET = int(os.getenv("FORMAL_TRANSCRIPT_MERGE_TARGET", "8000"))
+ASR_LOCK = threading.Lock()
+
+BILIBILI_CHINESE_SUBTITLE_LANGS = ["zh-Hans", "zh-CN", "zh-TW", "zh", "ai-zh"]
+BILIBILI_ENGLISH_SUBTITLE_LANGS = ["en", "en-US", "en-GB"]
+BILIBILI_SHORT_VIDEO_THRESHOLD_SECONDS = 600
 
 
 class NoteGenerator:
@@ -137,6 +143,8 @@ class NoteGenerator:
 
         try:
             logger.info(f"开始生成笔记 (task_id={task_id})")
+            self.video_path = None
+            self.video_img_urls = []
             self._update_status(
                 task_id,
                 TaskStatus.PARSING,
@@ -169,6 +177,7 @@ class NoteGenerator:
                 transcript_cache_file=transcript_cache_file,
                 status_phase=TaskStatus.TRANSCRIBING,
                 task_id=task_id,
+                platform=platform,
                 force_refresh=force_refresh_transcript,
                 allow_asr_fallback=False,
             )
@@ -342,18 +351,17 @@ class NoteGenerator:
         """
         downloader_cls = SUPPORT_PLATFORM_MAP.get(platform)
         logger.debug(f"实例化下载器 -  {platform}")
-        instance = None
         if not downloader_cls:
             logger.error(f"不支持的平台：{platform}")
             raise NoteError(code=NoteErrorEnum.PLATFORM_NOT_SUPPORTED.code,
                             message=NoteErrorEnum.PLATFORM_NOT_SUPPORTED.message)
         try:
-            instance = downloader_cls
+            instance: Downloader = downloader_cls()
         except Exception as e:
             logger.error(f"实例化下载器失败：{e}")
+            raise
 
-
-        logger.info(f"使用下载器：{downloader_cls.__class__}")
+        logger.info(f"使用下载器：{downloader_cls.__name__}")
         return instance
 
     @staticmethod
@@ -671,6 +679,81 @@ class NoteGenerator:
             self._handle_exception(task_id, exc, reason_code="AUDIO_DOWNLOAD_FAILED")
             raise
 
+    @staticmethod
+    def _normalize_subtitle_result(subtitle_result: Any) -> SubtitleFetchResult:
+        if isinstance(subtitle_result, SubtitleFetchResult):
+            return subtitle_result
+        if isinstance(subtitle_result, TranscriptResult):
+            return SubtitleFetchResult(
+                transcript=subtitle_result,
+                outcome="success",
+                message="使用平台字幕",
+            )
+        if subtitle_result is None:
+            return SubtitleFetchResult(
+                outcome="unavailable",
+                reason_code="SUBTITLE_NOT_AVAILABLE",
+                message="平台无可用字幕",
+            )
+        return SubtitleFetchResult(
+            outcome="error",
+            reason_code="SUBTITLE_FETCH_EXCEPTION",
+            message="字幕抓取返回结果异常",
+            diagnostics={"raw_type": subtitle_result.__class__.__name__},
+        )
+
+    @staticmethod
+    def _build_subtitle_diagnostics(
+        subtitle_result: Optional[SubtitleFetchResult],
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        diagnostics: Dict[str, Any] = {}
+        if subtitle_result:
+            diagnostics.update(subtitle_result.diagnostics or {})
+            if subtitle_result.outcome:
+                diagnostics.setdefault("subtitle_outcome", subtitle_result.outcome)
+            if subtitle_result.reason_code:
+                diagnostics.setdefault("subtitle_reason_code", subtitle_result.reason_code)
+            if subtitle_result.message:
+                diagnostics.setdefault("subtitle_message", subtitle_result.message)
+
+            transcript = subtitle_result.transcript
+            if transcript:
+                raw = transcript.raw if isinstance(transcript.raw, dict) else {}
+                diagnostics.setdefault("subtitle_source", raw.get("source") or diagnostics.get("provider"))
+                diagnostics.setdefault("subtitle_file", raw.get("file") or diagnostics.get("subtitle_file"))
+                diagnostics.setdefault("subtitle_language", transcript.language or raw.get("language"))
+                diagnostics.setdefault("subtitle_segment_count", len(transcript.segments or []))
+
+        if extra:
+            diagnostics.update(extra)
+        return diagnostics
+
+    @staticmethod
+    def _resolve_media_duration_seconds(
+        downloader: Downloader,
+        video_url: str,
+    ) -> Optional[float]:
+        try:
+            media_info = downloader.get_media_info(video_url=video_url, output_dir=None)
+        except Exception:
+            return None
+        if not media_info:
+            return None
+        duration = getattr(media_info, "duration", None)
+        try:
+            return float(duration) if duration is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _bilibili_fallback_subtitle_langs(duration_seconds: Optional[float]) -> List[str]:
+        if duration_seconds is None:
+            return []
+        if duration_seconds < BILIBILI_SHORT_VIDEO_THRESHOLD_SECONDS:
+            return list(BILIBILI_ENGLISH_SUBTITLE_LANGS)
+        return []
+
 
     def _get_transcript(
         self,
@@ -680,6 +763,7 @@ class NoteGenerator:
         transcript_cache_file: Path,
         status_phase: TaskStatus,
         task_id: Optional[str] = None,
+        platform: Optional[str] = None,
         force_refresh: bool = False,
         allow_asr_fallback: bool = True,
     ) -> TranscriptResult | None:
@@ -692,6 +776,7 @@ class NoteGenerator:
         :param transcript_cache_file: 缓存文件路径
         :param status_phase: 状态枚举
         :param task_id: 任务 ID
+        :param platform: 平台标识
         :param allow_asr_fallback: 是否允许在字幕失败后回退 ASR
         :return: TranscriptResult 对象
         """
@@ -722,28 +807,83 @@ class NoteGenerator:
 
         # 1. 先尝试获取平台字幕
         logger.info("尝试获取平台字幕...")
-        self._update_status(
-            task_id,
-            status_phase,
-            message="获取字幕/转写",
-            detail="正在尝试平台字幕",
-            source="subtitle",
-        )
-        try:
-            subtitle_result = downloader.download_subtitles(video_url)
-            if isinstance(subtitle_result, TranscriptResult):
-                subtitle_result = SubtitleFetchResult(
-                    transcript=subtitle_result,
-                    outcome="success",
-                    message="使用平台字幕",
+        normalized_platform = (platform or "").strip().lower()
+        subtitle_attempts: List[Tuple[str, Optional[List[str]]]] = [("默认字幕", None)]
+        policy_diagnostics: Dict[str, Any] = {"platform": normalized_platform or "unknown"}
+        if normalized_platform == "bilibili":
+            duration_seconds = self._resolve_media_duration_seconds(downloader, video_url)
+            fallback_langs = self._bilibili_fallback_subtitle_langs(duration_seconds)
+            subtitle_attempts = [("中文字幕", list(BILIBILI_CHINESE_SUBTITLE_LANGS))]
+            if fallback_langs:
+                subtitle_attempts.append(("英文字幕", fallback_langs))
+            policy_diagnostics.update(
+                {
+                    "duration_seconds": duration_seconds,
+                    "short_video_threshold_seconds": BILIBILI_SHORT_VIDEO_THRESHOLD_SECONDS,
+                    "english_fallback_enabled": bool(fallback_langs),
+                    "fallback_rule": "short_video_en_else_asr",
+                }
+            )
+
+        last_subtitle_result: Optional[SubtitleFetchResult] = None
+        for attempt_index, (attempt_label, langs) in enumerate(subtitle_attempts, start=1):
+            self._update_status(
+                task_id,
+                status_phase,
+                message="获取字幕/转写",
+                detail=f"正在尝试平台字幕（{attempt_label}）",
+                source="subtitle",
+                diagnostics=self._build_subtitle_diagnostics(
+                    last_subtitle_result,
+                    extra={
+                        **policy_diagnostics,
+                        "subtitle_attempt_label": attempt_label,
+                        "subtitle_attempt_index": attempt_index,
+                        "subtitle_attempt_total": len(subtitle_attempts),
+                        "requested_langs": langs or [],
+                    },
+                ),
+            )
+            try:
+                subtitle_result = self._normalize_subtitle_result(
+                    downloader.download_subtitles(video_url, langs=langs)
                 )
-            elif subtitle_result is None:
-                subtitle_result = SubtitleFetchResult(
-                    outcome="unavailable",
-                    reason_code="SUBTITLE_NOT_AVAILABLE",
-                    message="平台无可用字幕",
+            except Exception as e:
+                logger.warning(f"获取平台字幕失败 ({attempt_label}): {e}")
+                diagnostics = {
+                    **policy_diagnostics,
+                    "reason_code": "SUBTITLE_FETCH_EXCEPTION",
+                    "exception": str(e),
+                    "subtitle_attempt_label": attempt_label,
+                    "subtitle_attempt_index": attempt_index,
+                    "subtitle_attempt_total": len(subtitle_attempts),
+                    "requested_langs": langs or [],
+                }
+                has_next_attempt = attempt_index < len(subtitle_attempts)
+                next_action = "继续尝试其他字幕策略" if has_next_attempt else (
+                    "准备下载音频并转写" if not allow_asr_fallback else "回退到音频转写"
                 )
+                self._update_status(
+                    task_id,
+                    status_phase,
+                    message="获取字幕/转写",
+                    detail=f"字幕抓取异常（{attempt_label}），{next_action}：{e}",
+                    source="subtitle",
+                    diagnostics=diagnostics,
+                )
+                continue
+
             transcript = subtitle_result.transcript if subtitle_result else None
+            diagnostics = self._build_subtitle_diagnostics(
+                subtitle_result,
+                extra={
+                    **policy_diagnostics,
+                    "subtitle_attempt_label": attempt_label,
+                    "subtitle_attempt_index": attempt_index,
+                    "subtitle_attempt_total": len(subtitle_attempts),
+                    "requested_langs": langs or [],
+                },
+            )
             if transcript and transcript.segments:
                 logger.info(f"成功获取平台字幕，共 {len(transcript.segments)} 段")
                 # 缓存结果
@@ -755,35 +895,26 @@ class NoteGenerator:
                     task_id,
                     status_phase,
                     message="获取字幕/转写",
-                    detail=f"平台字幕获取成功，共 {len(transcript.segments)} 段",
+                    detail=f"平台字幕获取成功（{attempt_label}），共 {len(transcript.segments)} 段",
                     source="subtitle",
-                    diagnostics=getattr(subtitle_result, "diagnostics", None),
+                    diagnostics=diagnostics,
                 )
                 return transcript
 
+            last_subtitle_result = subtitle_result
             subtitle_message = (subtitle_result.message if subtitle_result else None) or "平台无可用字幕"
-            subtitle_reason_code = getattr(subtitle_result, "reason_code", None)
-            subtitle_diagnostics = getattr(subtitle_result, "diagnostics", None)
-            logger.info(f"{subtitle_message}，将使用音频转写")
-            fallback_text = "准备下载音频并转写" if not allow_asr_fallback else "回退到音频转写"
-            self._update_status(
-                task_id,
-                status_phase,
-                message="获取字幕/转写",
-                detail=f"{subtitle_message}，{fallback_text}",
-                source="subtitle",
-                diagnostics=subtitle_diagnostics or {"reason_code": subtitle_reason_code},
+            has_next_attempt = attempt_index < len(subtitle_attempts)
+            next_action = "继续尝试其他字幕策略" if has_next_attempt else (
+                "准备下载音频并转写" if not allow_asr_fallback else "回退到音频转写"
             )
-        except Exception as e:
-            logger.warning(f"获取平台字幕失败: {e}，将使用音频转写")
-            fallback_text = "准备下载音频并转写" if not allow_asr_fallback else "回退到音频转写"
+            logger.info(f"{subtitle_message}（{attempt_label}），{next_action}")
             self._update_status(
                 task_id,
                 status_phase,
                 message="获取字幕/转写",
-                detail=f"字幕抓取异常，{fallback_text}：{e}",
+                detail=f"{subtitle_message}（{attempt_label}），{next_action}",
                 source="subtitle",
-                diagnostics={"reason_code": "SUBTITLE_FETCH_EXCEPTION", "exception": str(e)},
+                diagnostics=diagnostics,
             )
 
         if not allow_asr_fallback:
@@ -847,12 +978,20 @@ class NoteGenerator:
                 task_id,
                 status_phase,
                 message="获取字幕/转写",
-                detail=f"正在执行 {self.transcriber_type} 音频转写",
+                detail=f"等待转写器资源（{self.transcriber_type}）",
                 source="asr",
             )
-            logger.info("开始转写音频")
-            transcriber = self._ensure_transcriber()
-            transcript = transcriber.transcript(file_path=audio_file)
+            with ASR_LOCK:
+                self._update_status(
+                    task_id,
+                    status_phase,
+                    message="获取字幕/转写",
+                    detail=f"正在执行 {self.transcriber_type} 音频转写",
+                    source="asr",
+                )
+                logger.info("开始转写音频")
+                transcriber = self._ensure_transcriber()
+                transcript = transcriber.transcript(file_path=audio_file)
             transcript_cache_file.write_text(json.dumps(asdict(transcript), ensure_ascii=False, indent=2), encoding="utf-8")
             logger.info(f"转写并缓存成功 ({transcript_cache_file})")
             self._update_status(

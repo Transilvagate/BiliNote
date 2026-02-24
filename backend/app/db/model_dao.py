@@ -55,6 +55,17 @@ def delete_model(model_id: int):
         db.close()
 
 
+def delete_models_by_provider(provider_id: int | str) -> int:
+    db = next(get_db())
+    try:
+        query = db.query(Model).filter_by(provider_id=provider_id)
+        deleted = query.delete(synchronize_session=False)
+        db.commit()
+        return int(deleted or 0)
+    finally:
+        db.close()
+
+
 def get_all_models():
     db = next(get_db())
     try:

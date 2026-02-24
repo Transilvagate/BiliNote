@@ -30,7 +30,7 @@
 
 ## 与上游的主要差异
 
-本 fork 的改动涉及 49 个文件（+5292 行 / -502 行），主要围绕三个方面：
+本 fork 的改动主要围绕三个方面：
 
 ### 1. BBDown 集成 —— 替换 B 站字幕获取方案
 
@@ -46,6 +46,7 @@
 | QR 登录（备用） | `backend/app/services/bilibili_qr_login_service.py` | 直接调用 B 站 Passport API 的 QR 登录方案（已标记为废弃，保留代码） |
 | 安全守卫 | `backend/app/security/config_guard.py` | 保护 Cookie/BBDown 等敏感接口：本地请求检测 + Admin Token 校验（HMAC 常量时间比较） |
 | B 站下载器 | `backend/app/downloaders/bilibili_downloader.py` | 重写字幕下载逻辑，路由到 BBDown；新增 SRT/VTT/ASS/JSON3/JSON 多格式字幕解析器 |
+| 字幕优先策略 | `backend/app/services/note.py` + `backend/app/downloaders/bilibili_downloader.py` | B站改为“中文字幕优先”；无中文时按时长分流：`<10分钟` 可尝试英文字幕，`>=10分钟` 或时长未知回退本地 ASR |
 | Docker 镜像 | `backend/Dockerfile` | 构建时自动下载 BBDown v1.6.3 Linux x64 二进制并安装到 `/usr/local/bin/` |
 | 后端路由 | `backend/app/routers/config.py` | 新增 BBDown 状态查询、登录启动/轮询/取消、字幕测试、Cookie 管理等 API 端点 |
 | 前端设置面板 | `BillNote_frontend/src/components/Form/DownloaderForm/Form.tsx` | 全新 BBDown 管理 UI：安装状态、QR 码扫码登录弹窗、Cookie 检测与清除、字幕下载测试、CLI 命令参考 |
@@ -149,9 +150,11 @@ data/notes/
 
 | 改动 | 说明 |
 |------|------|
+| 任务并发隔离 | 下载器由全局单例改为按任务实例化；ASR 增加互斥锁；BBDown 运行目录改为 `run_<timestamp>_<uuid>`，降低多任务串台风险 |
 | YouTube 下载器 | 重构字幕处理逻辑，新增 SRT/VTT/JSON3/JSON 解析器，增强诊断信息输出 |
 | 任务状态跟踪 | 状态 JSON 新增 `step`、`started_at`、`elapsed_ms`、`events[]`、`diagnostics` 字段 |
 | 前端任务轮询 | 支持展示详细进度步骤、耗时、技术诊断信息、失败重试按钮 |
+| 模型供应商管理 | 新增 `POST /delete_provider` 接口；支持删除供应商并级联删除其关联模型；前端设置页新增删除按钮 |
 | Docker Compose | 新增 Nginx 反向代理层，backend/frontend 改为仅暴露内部端口 |
 | 前端 Dockerfile | 调整构建配置 |
 

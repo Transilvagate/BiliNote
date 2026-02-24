@@ -3,6 +3,7 @@ import re
 import shutil
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -142,7 +143,7 @@ class BBDownClient:
             }
 
         output_dir.mkdir(parents=True, exist_ok=True)
-        run_dir = output_dir / f"run_{int(time.time() * 1000)}"
+        run_dir = output_dir / f"run_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
         run_dir.mkdir(parents=True, exist_ok=True)
         before_files = set(str(path) for path in self._list_subtitle_files(run_dir))
 

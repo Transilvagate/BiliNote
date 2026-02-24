@@ -8,8 +8,11 @@ from app.db.provider_dao import (
     get_provider_by_name,
     get_provider_by_id,
     update_provider,
-    delete_provider, get_enabled_providers,
+    delete_provider as delete_provider_record,
+    get_enabled_providers,
 )
+from app.db.engine import SessionLocal
+from app.db.models.models import Model
 from app.gpt.gpt_factory import GPTFactory
 from app.models.model_config import ModelConfig
 
@@ -130,5 +133,23 @@ class ProviderService:
             return None
 
     @staticmethod
+    def delete_provider_with_models(id: str) -> dict:
+        db = SessionLocal()
+        try:
+            provider = db.query(Provider).filter_by(id=id).first()
+            if not provider:
+                return {"id": id, "deleted": False, "deleted_models": 0}
+
+            deleted_models = db.query(Model).filter_by(provider_id=id).delete(synchronize_session=False)
+            db.delete(provider)
+            db.commit()
+            return {"id": id, "deleted": True, "deleted_models": int(deleted_models or 0)}
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    @staticmethod
     def delete_provider(id: str):
-        return delete_provider(id)
+        return delete_provider_record(id)

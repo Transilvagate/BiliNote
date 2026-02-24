@@ -175,7 +175,7 @@ class BilibiliDownloader(Downloader, ABC):
         """
         output_dir = self._resolve_output_dir(output_dir)
         if langs is None:
-            langs = ["zh-Hans", "zh", "zh-CN", "ai-zh", "en", "en-US"]
+            langs = ["zh-Hans", "zh-CN", "zh-TW", "zh", "ai-zh"]
 
         if self.subtitle_provider not in {"bbdown", "auto"}:
             return SubtitleFetchResult(
@@ -267,16 +267,23 @@ class BilibiliDownloader(Downloader, ABC):
         if not file_paths:
             return None
         ext_priority = {"srt": 0, "vtt": 1, "json3": 2, "json": 3, "ass": 4, "ssa": 5}
-        lang_tokens = [lang.lower() for lang in (langs or [])]
+        lang_tokens = [lang.lower().replace("_", "-") for lang in (langs or []) if lang]
+
+        def match_lang_token(filename: str, token: str) -> bool:
+            if not token:
+                return False
+            # Match language token with common delimiters to avoid fuzzy mismatches.
+            pattern = rf"(^|[.\-_\[\]\(\)\s]){re.escape(token)}($|[.\-_\[\]\(\)\s])"
+            return re.search(pattern, filename) is not None
 
         def sort_key(path_str: str) -> Tuple[int, int, str]:
             path = Path(path_str)
             ext = path.suffix.lower().lstrip(".")
-            name = path.name.lower()
-            lang_rank = 1
-            for token in lang_tokens:
-                if token and token in name:
-                    lang_rank = 0
+            name = path.name.lower().replace("_", "-")
+            lang_rank = len(lang_tokens) + 1
+            for idx, token in enumerate(lang_tokens):
+                if match_lang_token(name, token):
+                    lang_rank = idx
                     break
             return (lang_rank, ext_priority.get(ext, 9), path.name)
 
@@ -284,9 +291,13 @@ class BilibiliDownloader(Downloader, ABC):
 
     @staticmethod
     def _guess_lang_from_filename(file_path: str, langs: List[str]) -> str:
-        filename = Path(file_path).name.lower()
+        filename = Path(file_path).name.lower().replace("_", "-")
         for lang in langs:
-            if lang and lang.lower() in filename:
+            token = (lang or "").lower().replace("_", "-")
+            if not token:
+                continue
+            pattern = rf"(^|[.\-_\[\]\(\)\s]){re.escape(token)}($|[.\-_\[\]\(\)\s])"
+            if re.search(pattern, filename):
                 return lang
         return "zh"
 
