@@ -1042,12 +1042,27 @@ class NoteGenerator:
             f"{audio_meta.title}\n{audio_meta.raw_info.get('tags', '')}\n{segment_text_for_budget}\n{extras or ''}"
         )
         context_limit = resolve_context_limit(model_name)
-        include_formal_transcript = "formal_transcript" in formats
+        output_budget = max(min(FORMAL_TRANSCRIPT_OUTPUT_RESERVE, context_limit // 2), 1200)
+
+        effective_formats = list(formats or [])
+        include_formal_transcript = "formal_transcript" in effective_formats
+        formal_tokens = estimate_tokens(segment_text_for_budget) if include_formal_transcript else 0
         overflow = include_formal_transcript and is_overflow(
             estimated_input=estimated_tokens,
             context_limit=context_limit,
             reserve_output=FORMAL_TRANSCRIPT_OUTPUT_RESERVE,
         )
+        chunk_reasons: List[str] = []
+        if include_formal_transcript:
+            if overflow:
+                chunk_reasons.append("input_overflow")
+            if formal_tokens > output_budget:
+                chunk_reasons.append("formal_tokens_exceed_output_budget")
+            if estimated_tokens + formal_tokens > context_limit:
+                chunk_reasons.append("combined_input_formal_exceed_context")
+
+        need_chunked_formal = include_formal_transcript and bool(chunk_reasons)
+        chunk_reason = ",".join(chunk_reasons) if chunk_reasons else "none"
 
         self._update_status(
             task_id,
@@ -1056,25 +1071,30 @@ class NoteGenerator:
             detail="正在调用大模型生成笔记",
             source="gpt",
             diagnostics={
-                "formal_transcript_mode": "chunked" if overflow else ("single" if include_formal_transcript else "disabled"),
+                "formal_transcript_mode": "chunked" if need_chunked_formal else ("single" if include_formal_transcript else "disabled"),
                 "estimated_tokens": estimated_tokens,
                 "context_limit": context_limit,
+                "formal_tokens": formal_tokens,
+                "output_budget": output_budget,
+                "chunk_reason": chunk_reason,
             },
         )
 
-        effective_formats = list(formats or [])
-        if overflow:
+        if need_chunked_formal:
             effective_formats = [item for item in effective_formats if item != "formal_transcript"]
             self._update_status(
                 task_id,
                 TaskStatus.SUMMARIZING,
                 message="总结内容",
-                detail="检测到正式文稿上下文超限，切换为分块生成",
+                detail="检测到正式文稿可能超长，切换为分块生成",
                 source="gpt",
                 diagnostics={
                     "formal_transcript_mode": "chunked",
                     "estimated_tokens": estimated_tokens,
                     "context_limit": context_limit,
+                    "formal_tokens": formal_tokens,
+                    "output_budget": output_budget,
+                    "chunk_reason": chunk_reason,
                 },
             )
 
@@ -1096,14 +1116,16 @@ class NoteGenerator:
 
             formal_section_detected = False
             chunk_count = 0
-            if include_formal_transcript and overflow:
-                formal_text, chunk_count = self._generate_formal_transcript_chunked(
+            merge_strategy: Optional[str] = None
+            if include_formal_transcript and need_chunked_formal:
+                formal_text, chunk_count, merge_strategy = self._generate_formal_transcript_chunked(
                     gpt=gpt,
                     transcript=transcript,
                     title=audio_meta.title,
                     task_id=task_id,
                     context_limit=context_limit,
                     formal_transcript_style=formal_transcript_style,
+                    output_budget=output_budget,
                 )
                 markdown = self._append_formal_transcript_at_end(markdown=markdown, formal_text=formal_text)
                 formal_section_detected = True
@@ -1114,13 +1136,18 @@ class NoteGenerator:
             logger.info(f"GPT 总结并缓存成功 ({markdown_cache_file})")
 
             diagnostics = {
-                "formal_transcript_mode": "chunked" if overflow else ("single" if include_formal_transcript else "disabled"),
+                "formal_transcript_mode": "chunked" if need_chunked_formal else ("single" if include_formal_transcript else "disabled"),
                 "estimated_tokens": estimated_tokens,
                 "context_limit": context_limit,
+                "formal_tokens": formal_tokens,
+                "output_budget": output_budget,
+                "chunk_reason": chunk_reason,
                 "formal_section_detected": formal_section_detected,
             }
             if chunk_count:
                 diagnostics["chunk_count"] = chunk_count
+            if merge_strategy:
+                diagnostics["merge_strategy"] = merge_strategy
 
             self._update_status(
                 task_id,
@@ -1359,9 +1386,11 @@ class NoteGenerator:
         task_id: Optional[str],
         context_limit: int,
         formal_transcript_style: str,
-    ) -> Tuple[str, int]:
-        chunk_target = min(FORMAL_TRANSCRIPT_CHUNK_TARGET, max(context_limit - FORMAL_TRANSCRIPT_OUTPUT_RESERVE, 1200))
-        merge_target = min(FORMAL_TRANSCRIPT_MERGE_TARGET, max(context_limit - FORMAL_TRANSCRIPT_OUTPUT_RESERVE, 1600))
+        output_budget: int,
+    ) -> Tuple[str, int, str]:
+        # Keep chunk/merge requests within a conservative output budget to reduce truncation risk.
+        chunk_target = min(FORMAL_TRANSCRIPT_CHUNK_TARGET, output_budget)
+        merge_target = min(FORMAL_TRANSCRIPT_MERGE_TARGET, output_budget)
         chunks = self._chunk_transcript_segments(transcript.segments, target_tokens=chunk_target)
         chunk_count = len(chunks)
         generated_parts: List[str] = []
@@ -1377,6 +1406,7 @@ class NoteGenerator:
                     "formal_transcript_mode": "chunked",
                     "chunk_count": chunk_count,
                     "current_chunk": chunk_index,
+                    "output_budget": output_budget,
                 },
             )
             chunk_text = self._build_segment_text_for_budget(chunk_segments)
@@ -1393,27 +1423,53 @@ class NoteGenerator:
                 raise RuntimeError(f"正式文稿分块生成失败 (chunk={chunk_index}/{chunk_count}): {exc}") from exc
             generated_parts.append(chunk_content)
 
-        self._update_status(
-            task_id,
-            TaskStatus.SUMMARIZING,
-            message="总结内容",
-            detail="正式文稿合并润色中",
-            source="gpt",
-            diagnostics={
-                "formal_transcript_mode": "chunked",
-                "chunk_count": chunk_count,
-                "current_chunk": chunk_count,
-            },
-        )
+        generated_total_tokens = sum(estimate_tokens(part) for part in generated_parts if part)
+        if generated_total_tokens > output_budget:
+            merge_strategy = "concat"
+            self._update_status(
+                task_id,
+                TaskStatus.SUMMARIZING,
+                message="总结内容",
+                detail="正式文稿分块拼接中（跳过合并润色以避免截断）",
+                source="gpt",
+                diagnostics={
+                    "formal_transcript_mode": "chunked",
+                    "chunk_count": chunk_count,
+                    "current_chunk": chunk_count,
+                    "output_budget": output_budget,
+                    "generated_part_tokens": generated_total_tokens,
+                    "merge_strategy": merge_strategy,
+                },
+            )
+            formal_text = "\n\n".join(
+                part.strip() for part in generated_parts if part and part.strip()
+            )
+        else:
+            merge_strategy = "llm_merge"
+            self._update_status(
+                task_id,
+                TaskStatus.SUMMARIZING,
+                message="总结内容",
+                detail="正式文稿合并润色中",
+                source="gpt",
+                diagnostics={
+                    "formal_transcript_mode": "chunked",
+                    "chunk_count": chunk_count,
+                    "current_chunk": chunk_count,
+                    "output_budget": output_budget,
+                    "generated_part_tokens": generated_total_tokens,
+                    "merge_strategy": merge_strategy,
+                },
+            )
+            formal_text = self._merge_formal_transcript_parts(
+                gpt=gpt,
+                title=title,
+                parts=generated_parts,
+                merge_target=merge_target,
+                formal_transcript_style=formal_transcript_style,
+            )
 
-        formal_text = self._merge_formal_transcript_parts(
-            gpt=gpt,
-            title=title,
-            parts=generated_parts,
-            merge_target=merge_target,
-            formal_transcript_style=formal_transcript_style,
-        )
-        return formal_text, chunk_count
+        return formal_text, chunk_count, merge_strategy
 
     @staticmethod
     def _extract_formal_transcript_section(markdown: str) -> Tuple[str, Optional[str]]:
