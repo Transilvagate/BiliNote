@@ -27,7 +27,10 @@ interface NoteHeaderProps {
   onCopy: () => void
   onDownload: () => void
   createAt?: string | Date
+  showTranscribe: boolean
   setShowTranscribe: (show: boolean) => void
+  viewMode: 'map' | 'preview'
+  setViewMode: (view: 'map' | 'preview') => void
 }
 
 export function MarkdownHeader({
@@ -63,10 +66,6 @@ export function MarkdownHeader({
 
   const styleName = noteStyles.find(v => v.value === style)?.label || style
 
-  const reversedMarkdown: VersionNote[] = Array.isArray(currentTask?.markdown)
-    ? [...currentTask!.markdown].reverse()
-    : []
-
   const formatDate = (date: string | Date | undefined) => {
     if (!date) return ''
     const d = typeof date === 'string' ? new Date(date) : date
@@ -91,14 +90,15 @@ export function MarkdownHeader({
             <SelectTrigger className="h-8 w-[160px] text-sm">
               <div className="flex items-center">
                 {(() => {
-                  const idx = currentTask?.markdown.findIndex(v => v.ver_id === currentVerId)
+                  const versionList = Array.isArray(currentTask?.markdown) ? currentTask.markdown : []
+                  const idx = versionList.findIndex(v => v.ver_id === currentVerId)
                   return idx !== -1 ? `版本（${currentVerId.slice(-6)}）` : ''
                 })()}
               </div>
             </SelectTrigger>
 
             <SelectContent>
-              {(currentTask?.markdown || []).map((v, idx) => {
+              {(Array.isArray(currentTask?.markdown) ? currentTask.markdown : []).map(v => {
                 const shortId = v.ver_id.slice(-6)
                 return (
                   <SelectItem key={v.ver_id} value={v.ver_id}>
@@ -159,10 +159,10 @@ export function MarkdownHeader({
             <TooltipTrigger asChild>
               <Button onClick={onDownload} variant="ghost" size="sm" className="h-8 px-2">
                 <Download className="mr-1.5 h-4 w-4" />
-                <span className="text-sm">导出 Markdown</span>
+                <span className="text-sm">导出Markdown(含附件)</span>
               </Button>
             </TooltipTrigger>
-            <TooltipContent>下载为 Markdown 文件</TooltipContent>
+            <TooltipContent>下载ZIP（Markdown + assets）</TooltipContent>
           </Tooltip>
         </TooltipProvider>
         <TooltipProvider>

@@ -1,10 +1,7 @@
 import { useTaskStore } from '@/store/taskStore'
-import { ScrollArea } from '@/components/ui/scroll-area.tsx'
-import { Badge } from '@/components/ui/badge.tsx'
 import { cn } from '@/lib/utils.ts'
 import { Trash } from 'lucide-react'
 import { Button } from '@/components/ui/button.tsx'
-import PinyinMatch from 'pinyin-match'
 import Fuse from 'fuse.js'
 
 import {
@@ -14,7 +11,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip.tsx'
 import LazyImage from "@/components/LazyImage.tsx";
-import {FC, useState ,useEffect } from 'react'
+import {FC, useState } from 'react'
 
 interface NoteHistoryProps {
   onSelect: (taskId: string) => void
@@ -26,20 +23,11 @@ const NoteHistory: FC<NoteHistoryProps> = ({ onSelect, selectedId }) => {
   const removeTask = useTaskStore(state => state.removeTask)
   // 确保baseURL没有尾部斜杠
   const baseURL = (String(import.meta.env.VITE_API_BASE_URL || 'api')).replace(/\/$/, '')
-  const [rawSearch, setRawSearch] = useState('')
   const [search, setSearch] = useState('')
   const fuse = new Fuse(tasks, {
     keys: ['audioMeta.title'],
     threshold: 0.4 // 匹配精度（越低越严格）
   })
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      if (rawSearch === '') return
-      setSearch(rawSearch)
-    }, 300) // 300ms 防抖
-
-    return () => clearTimeout(timer)
-  }, [rawSearch])
   const filteredTasks = search.trim()
       ? fuse.search(search).map(result => result.item)
       : tasks
@@ -134,14 +122,16 @@ const NoteHistory: FC<NoteHistoryProps> = ({ onSelect, selectedId }) => {
                   </div>
                 )}
                 {task.status !== 'SUCCESS' && task.status !== 'FAILED' ? (
-                  <div className={'w-10 rounded bg-green-500 p-0.5 text-center text-white'}>
-                    等待中
+                  <div className={'rounded bg-green-500 px-1.5 py-0.5 text-center text-white'}>
+                    {task.progress?.step?.label || task.progress?.message || '进行中'}
                   </div>
                 ) : (
                   <></>
                 )}
                 {task.status === 'FAILED' && (
-                  <div className={'w-10 rounded bg-red-500 p-0.5 text-center text-white'}>失败</div>
+                  <div className={'rounded bg-red-500 px-1.5 py-0.5 text-center text-white'}>
+                    {task.progress?.message || '失败'}
+                  </div>
                 )}
               </div>
 
@@ -176,6 +166,9 @@ const NoteHistory: FC<NoteHistoryProps> = ({ onSelect, selectedId }) => {
               {/*  {task.status === 'FAILED' && <Badge variant="destructive">失败</Badge>}*/}
               {/*</div>*/}
             </div>
+            {task.status !== 'SUCCESS' && task.progress?.detail ? (
+              <div className="mt-1 line-clamp-1 text-[11px] text-neutral-500">{task.progress.detail}</div>
+            ) : null}
           </div>
         ))}
       </div>

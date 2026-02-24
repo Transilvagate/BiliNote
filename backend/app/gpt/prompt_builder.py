@@ -1,10 +1,18 @@
-from app.gpt.prompt import BASE_PROMPT
+from app.gpt.prompt import (
+    BASE_PROMPT,
+    FORMAL_TRANSCRIPT_BASE,
+    FORMAL_TRANSCRIPT_STYLE_AUTO,
+    FORMAL_TRANSCRIPT_STYLE_SINGLE_NARRATION,
+    FORMAL_TRANSCRIPT_STYLE_LEAD_PLUS_SUPPORT,
+    FORMAL_TRANSCRIPT_STYLE_MULTI_DIALOGUE,
+)
 
 note_formats = [
     {'label': '目录', 'value': 'toc'},
     {'label': '原片跳转', 'value': 'link'},
     {'label': '原片截图', 'value': 'screenshot'},
-    {'label': 'AI总结', 'value': 'summary'}
+    {'label': 'AI总结', 'value': 'summary'},
+    {'label': '正式文稿', 'value': 'formal_transcript'},
 ]
 
 note_styles = [
@@ -21,7 +29,15 @@ note_styles = [
 
 
 # 生成 BASE_PROMPT 函数
-def generate_base_prompt(title, segment_text, tags, _format=None, style=None, extras=None):
+def generate_base_prompt(
+    title,
+    segment_text,
+    tags,
+    _format=None,
+    style=None,
+    extras=None,
+    formal_transcript_style=None,
+):
     # 生成 Base Prompt 开头部分
     prompt = BASE_PROMPT.format(
         video_title=title,
@@ -31,7 +47,9 @@ def generate_base_prompt(title, segment_text, tags, _format=None, style=None, ex
 
     # 添加用户选择的格式
     if _format:
-        prompt += "\n" + "\n".join([get_format_function(f) for f in _format])
+        prompt += "\n" + "\n".join(
+            [get_format_function(f, formal_transcript_style=formal_transcript_style) for f in _format]
+        )
 
     # 根据用户选择的笔记风格添加描述
     if style:
@@ -44,12 +62,13 @@ def generate_base_prompt(title, segment_text, tags, _format=None, style=None, ex
 
 
 # 获取格式函数
-def get_format_function(format_type):
+def get_format_function(format_type, formal_transcript_style=None):
     format_map = {
         'toc': get_toc_format,
         'link': get_link_format,
         'screenshot': get_screenshot_format,
-        'summary': get_summary_format
+        'summary': get_summary_format,
+        'formal_transcript': lambda: get_formal_transcript_format(formal_transcript_style=formal_transcript_style),
     }
     return format_map.get(format_type, lambda: '')()
 
@@ -113,3 +132,15 @@ def get_summary_format():
     return '''
     12. **AI总结**: 在笔记末尾加入简短的AI生成总结,并且二级标题 就是 AI 总结 例如 ## AI 总结。
     '''
+
+
+def get_formal_transcript_format(formal_transcript_style=None):
+    style_key = (formal_transcript_style or "auto").strip().lower()
+    style_map = {
+        "auto": FORMAL_TRANSCRIPT_STYLE_AUTO,
+        "single_narration": FORMAL_TRANSCRIPT_STYLE_SINGLE_NARRATION,
+        "lead_plus_support": FORMAL_TRANSCRIPT_STYLE_LEAD_PLUS_SUPPORT,
+        "multi_dialogue": FORMAL_TRANSCRIPT_STYLE_MULTI_DIALOGUE,
+    }
+    style_block = style_map.get(style_key, FORMAL_TRANSCRIPT_STYLE_AUTO)
+    return f"{FORMAL_TRANSCRIPT_BASE}\n{style_block}".strip()

@@ -4,8 +4,16 @@ import { delete_task, generateNote } from '@/services/note.ts'
 import { v4 as uuidv4 } from 'uuid'
 import toast from 'react-hot-toast'
 
-
-export type TaskStatus = 'PENDING' | 'RUNNING' | 'SUCCESS' | 'FAILD'
+export type TaskStatus =
+  | 'PENDING'
+  | 'PARSING'
+  | 'DOWNLOADING'
+  | 'TRANSCRIBING'
+  | 'SUMMARIZING'
+  | 'FORMATTING'
+  | 'SAVING'
+  | 'SUCCESS'
+  | 'FAILED'
 
 export interface AudioMeta {
   cover_url: string
@@ -29,6 +37,41 @@ export interface Transcript {
   raw: any
   segments: Segment[]
 }
+
+export interface TaskProgressStep {
+  key: string
+  label: string
+  index: number
+  total: number
+}
+
+export interface TaskProgressEvent {
+  at: string
+  status: string
+  message: string
+  detail?: string
+  source?: string
+  diagnostics?: Record<string, any>
+}
+
+export interface TaskProgressError {
+  reason_code?: string
+  retryable?: boolean
+}
+
+export interface TaskProgress {
+  message?: string
+  detail?: string
+  source?: string
+  step?: TaskProgressStep
+  started_at?: string
+  updated_at?: string
+  elapsed_ms?: number
+  events?: TaskProgressEvent[]
+  diagnostics?: Record<string, any>
+  error?: TaskProgressError
+}
+
 export interface Markdown {
   ver_id: string
   content: string
@@ -42,6 +85,8 @@ export interface Task {
   markdown: string|Markdown [] //为了兼容之前的笔记
   transcript: Transcript
   status: TaskStatus
+  platform: string
+  progress?: TaskProgress
   audioMeta: AudioMeta
   createdAt: string
   formData: {
@@ -52,19 +97,27 @@ export interface Task {
     quality: string
     model_name: string
     provider_id: string
+    style?: string
+    formal_transcript_style?: 'auto' | 'single_narration' | 'lead_plus_support' | 'multi_dialogue'
+    extras?: string
+    format?: string[]
+    video_understanding?: boolean
+    video_interval?: number
+    grid_size?: number[]
+    task_id?: string
   }
 }
 
 interface TaskStore {
   tasks: Task[]
   currentTaskId: string | null
-  addPendingTask: (taskId: string, platform: string) => void
+  addPendingTask: (taskId: string, platform: string, formData: any) => void
   updateTaskContent: (id: string, data: Partial<Omit<Task, 'id' | 'createdAt'>>) => void
   removeTask: (id: string) => void
   clearTasks: () => void
   setCurrentTask: (taskId: string | null) => void
   getCurrentTask: () => Task | null
-  retryTask: (id: string) => void
+  retryTask: (id: string, payload?: any) => Promise<void>
 }
 
 export const useTaskStore = create<TaskStore>()(
@@ -83,6 +136,13 @@ export const useTaskStore = create<TaskStore>()(
               status: 'PENDING',
               markdown: '',
               platform: platform,
+              progress: {
+                message: '任务排队中',
+                detail: '任务已提交，等待后端开始处理',
+                source: 'system',
+                events: [],
+                diagnostics: {},
+              },
               transcript: {
                 full_text: '',
                 language: '',
@@ -111,6 +171,13 @@ export const useTaskStore = create<TaskStore>()(
               if (task.id !== id) return task
 
               if (task.status === 'SUCCESS' && data.status === 'SUCCESS') return task
+              const mergedData = {
+                ...data,
+                progress: {
+                  ...(task.progress || {}),
+                  ...(data.progress || {}),
+                },
+              }
 
               // 如果是 markdown 字符串，封装为版本
               if (typeof data.markdown === 'string') {
@@ -143,12 +210,12 @@ export const useTaskStore = create<TaskStore>()(
 
                 return {
                   ...task,
-                  ...data,
+                  ...mergedData,
                   markdown: updatedMarkdown,
                 }
               }
 
-              return { ...task, ...data }
+              return { ...task, ...mergedData }
             }),
           })),
 
@@ -171,6 +238,7 @@ export const useTaskStore = create<TaskStore>()(
         await generateNote({
           ...newFormData,
           task_id: id,
+          force_refresh_transcript: true,
         })
 
         set(state => ({
@@ -180,6 +248,12 @@ export const useTaskStore = create<TaskStore>()(
                     ...t,
                     formData: newFormData, // ✅ 显式更新 formData
                     status: 'PENDING',
+                    progress: {
+                      ...(t.progress || {}),
+                      message: '任务重试中',
+                      detail: '正在重新拉取字幕与转写',
+                      source: 'system',
+                    },
                   }
                   : t
           ),
@@ -211,6 +285,32 @@ export const useTaskStore = create<TaskStore>()(
     }),
     {
       name: 'task-storage',
+      version: 3,
+      migrate: (persistedState: any, version) => {
+        if (version < 2) {
+          return {
+            tasks: [],
+            currentTaskId: null,
+          }
+        }
+        if (version < 3 && persistedState?.tasks) {
+          return {
+            ...persistedState,
+            tasks: persistedState.tasks.map((task: any) => ({
+              ...task,
+              status: task.status === 'FAILD' ? 'FAILED' : task.status,
+              progress: task.progress || {
+                message: task.status === 'SUCCESS' ? '任务完成' : '任务处理中',
+                detail: '',
+                source: 'system',
+                events: [],
+                diagnostics: {},
+              },
+            })),
+          }
+        }
+        return persistedState
+      },
     }
   )
 )

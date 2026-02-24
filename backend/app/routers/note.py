@@ -1,27 +1,30 @@
 # app/routers/note.py
+import io
 import json
 import os
 import uuid
 from pathlib import Path
-from typing import Optional
-from urllib.parse import urlparse
+from typing import Literal, Optional
+from urllib.parse import quote, urlparse
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks, UploadFile, File
-from pydantic import BaseModel, validator, field_validator
+import httpx
 from dataclasses import asdict
+
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel, field_validator
 
 from app.db.video_task_dao import get_task_by_video
 from app.enmus.exception import NoteErrorEnum
 from app.enmus.note_enums import DownloadQuality
+from app.enmus.task_status_enums import TaskStatus
 from app.exceptions.note import NoteError
+from app.services.markdown_bundle_export import MarkdownBundleExporter
 from app.services.note import NoteGenerator, logger
 from app.utils.response import ResponseWrapper as R
+from app.utils.task_assets import get_task_assets_dir, safe_join_under
 from app.utils.url_parser import extract_video_id
 from app.validators.video_url_validator import is_supported_video_url
-from fastapi import APIRouter, Request, HTTPException
-from fastapi.responses import StreamingResponse
-import httpx
-from app.enmus.task_status_enums import TaskStatus
 
 # from app.services.downloader import download_raw_audio
 # from app.services.whisperer import transcribe_audio
@@ -46,9 +49,16 @@ class VideoRequest(BaseModel):
     format: Optional[list] = []
     style: str = None
     extras: Optional[str]=None
+    formal_transcript_style: Literal[
+        "auto",
+        "single_narration",
+        "lead_plus_support",
+        "multi_dialogue",
+    ] = "auto"
     video_understanding: Optional[bool] = False
     video_interval: Optional[int] = 0
     grid_size: Optional[list] = []
+    force_refresh_transcript: Optional[bool] = None
 
     @field_validator("video_url")
     def validate_supported_url(cls, v):
@@ -63,6 +73,11 @@ class VideoRequest(BaseModel):
         return v
 
 
+class ExportMarkdownRequest(BaseModel):
+    title: str
+    markdown: str
+
+
 NOTE_OUTPUT_DIR = os.getenv("NOTE_OUTPUT_DIR", "note_results")
 UPLOAD_DIR = "uploads"
 
@@ -75,9 +90,12 @@ def save_note_to_file(task_id: str, note):
 
 def run_note_task(task_id: str, video_url: str, platform: str, quality: DownloadQuality,
                   link: bool = False, screenshot: bool = False, model_name: str = None, provider_id: str = None,
-                  _format: list = None, style: str = None, extras: str = None, video_understanding: bool = False,
-                  video_interval=0, grid_size=[]
+                  _format: list = None, style: str = None, extras: str = None, formal_transcript_style: str = "auto",
+                  video_understanding: bool = False,
+                  video_interval=0, grid_size=None, force_refresh_transcript: bool = False
                   ):
+    if grid_size is None:
+        grid_size = []
 
     if not model_name or not provider_id:
         raise HTTPException(status_code=400, detail="请选择模型和提供者")
@@ -93,10 +111,12 @@ def run_note_task(task_id: str, video_url: str, platform: str, quality: Download
         _format=_format,
         style=style,
         extras=extras,
+        formal_transcript_style=formal_transcript_style,
         screenshot=screenshot
         , video_understanding=video_understanding,
         video_interval=video_interval,
-        grid_size=grid_size
+        grid_size=grid_size,
+        force_refresh_transcript=force_refresh_transcript,
     )
     logger.info(f"Note generated: {task_id}")
     if not note or not note.markdown:
@@ -144,16 +164,39 @@ def generate_note(data: VideoRequest, background_tasks: BackgroundTasks):
         if data.task_id:
             # 如果传了task_id，说明是重试！
             task_id = data.task_id
+            force_refresh_transcript = (
+                data.force_refresh_transcript
+                if data.force_refresh_transcript is not None
+                else True
+            )
             # 更新之前的状态
-            NoteGenerator()._update_status(task_id, TaskStatus.PENDING)
+            NoteGenerator()._update_status(
+                task_id,
+                TaskStatus.PENDING,
+                message="任务重试中",
+                detail="已提交重试任务，正在重新拉取字幕与转写",
+                source="system",
+                diagnostics={"force_refresh_transcript": force_refresh_transcript},
+            )
             logger.info(f"重试模式，复用已有 task_id={task_id}")
         else:
             # 正常新建任务
             task_id = str(uuid.uuid4())
+            force_refresh_transcript = bool(data.force_refresh_transcript)
+            NoteGenerator()._update_status(
+                task_id,
+                TaskStatus.PENDING,
+                message="任务排队中",
+                detail="任务已提交，等待开始处理",
+                source="system",
+                diagnostics={"force_refresh_transcript": force_refresh_transcript},
+            )
 
         background_tasks.add_task(run_note_task, task_id, data.video_url, data.platform, data.quality, data.link,
                                   data.screenshot, data.model_name, data.provider_id, data.format, data.style,
-                                  data.extras, data.video_understanding, data.video_interval, data.grid_size)
+                                  data.extras, data.formal_transcript_style,
+                                  data.video_understanding, data.video_interval, data.grid_size,
+                                  force_refresh_transcript)
         return R.success({"task_id": task_id})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -169,37 +212,45 @@ def get_task_status(task_id: str):
         with open(status_path, "r", encoding="utf-8") as f:
             status_content = json.load(f)
 
-        status = status_content.get("status")
-        message = status_content.get("message", "")
+        status = status_content.get("status", TaskStatus.PENDING.value)
+        payload = {
+            "status": status,
+            "message": status_content.get("message", ""),
+            "detail": status_content.get("detail", ""),
+            "task_id": task_id,
+            "step": status_content.get("step"),
+            "source": status_content.get("source"),
+            "started_at": status_content.get("started_at"),
+            "updated_at": status_content.get("updated_at"),
+            "elapsed_ms": status_content.get("elapsed_ms"),
+            "events": status_content.get("events", []),
+            "diagnostics": status_content.get("diagnostics", {}),
+        }
+        if status_content.get("error"):
+            payload["error"] = status_content.get("error")
 
         if status == TaskStatus.SUCCESS.value:
             # 成功状态的话，继续读取最终笔记内容
             if os.path.exists(result_path):
                 with open(result_path, "r", encoding="utf-8") as rf:
                     result_content = json.load(rf)
-                return R.success({
-                    "status": status,
-                    "result": result_content,
-                    "message": message,
-                    "task_id": task_id
-                })
+                payload["result"] = result_content
+                return R.success(payload)
             else:
                 # 理论上不会出现，保险处理
-                return R.success({
+                payload.update({
                     "status": TaskStatus.PENDING.value,
                     "message": "任务完成，但结果文件未找到",
-                    "task_id": task_id
                 })
+                return R.success(payload)
 
         if status == TaskStatus.FAILED.value:
-            return R.error(message or "任务失败", code=500)
+            if not payload.get("error"):
+                payload["error"] = {"reason_code": "TASK_FAILED", "retryable": True}
+            return R.success(payload)
 
         # 处理中状态
-        return R.success({
-            "status": status,
-            "message": message,
-            "task_id": task_id
-        })
+        return R.success(payload)
 
     # 没有状态文件，但有结果
     if os.path.exists(result_path):
@@ -208,15 +259,46 @@ def get_task_status(task_id: str):
         return R.success({
             "status": TaskStatus.SUCCESS.value,
             "result": result_content,
-            "task_id": task_id
+            "task_id": task_id,
+            "message": "任务完成",
         })
 
     # 什么都没有，默认PENDING
     return R.success({
         "status": TaskStatus.PENDING.value,
         "message": "任务排队中",
-        "task_id": task_id
+        "detail": "任务尚未开始，请稍候",
+        "task_id": task_id,
+        "events": [],
+        "diagnostics": {},
     })
+
+
+@router.get("/tasks/{task_id}/assets/{asset_path:path}")
+def get_task_asset(task_id: str, asset_path: str):
+    assets_dir = get_task_assets_dir(task_id, create=False)
+    try:
+        file_path = safe_join_under(assets_dir, asset_path)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="图片不存在")
+
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="图片不存在")
+
+    return FileResponse(str(file_path))
+
+
+@router.post("/tasks/{task_id}/export-md")
+def export_markdown_with_assets(task_id: str, payload: ExportMarkdownRequest):
+    exporter = MarkdownBundleExporter(task_id=task_id, title=payload.title, markdown=payload.markdown)
+    result = exporter.build()
+    for item in result.warnings:
+        logger.warning(f"[export-md] task_id={task_id}: {item}")
+
+    headers = {
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quote(result.zip_filename)}",
+    }
+    return StreamingResponse(io.BytesIO(result.zip_bytes), media_type="application/zip", headers=headers)
 
 
 @router.get("/image_proxy")

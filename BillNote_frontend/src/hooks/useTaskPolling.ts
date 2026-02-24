@@ -6,8 +6,6 @@ import toast from 'react-hot-toast'
 export const useTaskPolling = (interval = 3000) => {
   const tasks = useTaskStore(state => state.tasks)
   const updateTaskContent = useTaskStore(state => state.updateTaskContent)
-  const updateTaskStatus = useTaskStore(state => state.updateTaskStatus)
-  const removeTask = useTaskStore(state => state.removeTask)
 
   const tasksRef = useRef(tasks)
 
@@ -27,9 +25,28 @@ export const useTaskPolling = (interval = 3000) => {
           console.log('🔄 正在轮询任务：', task.id)
           const res = await get_task_status(task.id)
           const { status } = res
+          const progress = {
+            message: res.message,
+            detail: res.detail,
+            source: res.source,
+            step: res.step,
+            started_at: res.started_at,
+            updated_at: res.updated_at,
+            elapsed_ms: res.elapsed_ms,
+            events: res.events || [],
+            diagnostics: res.diagnostics || {},
+            error: res.error,
+          }
 
-          if (status && status !== task.status) {
-            if (status === 'SUCCESS') {
+          const shouldUpdate =
+            !!status &&
+            (status !== task.status ||
+              progress.updated_at !== task.progress?.updated_at ||
+              progress.detail !== task.progress?.detail ||
+              progress.message !== task.progress?.message)
+
+          if (shouldUpdate) {
+            if (status === 'SUCCESS' && res.result) {
               const { markdown, transcript, audio_meta } = res.result
               toast.success('笔记生成成功')
               updateTaskContent(task.id, {
@@ -37,19 +54,29 @@ export const useTaskPolling = (interval = 3000) => {
                 markdown,
                 transcript,
                 audioMeta: audio_meta,
+                progress,
               })
+            } else if (status === 'SUCCESS') {
+              updateTaskContent(task.id, { status, progress })
             } else if (status === 'FAILED') {
-              updateTaskContent(task.id, { status })
+              updateTaskContent(task.id, { status, progress })
               console.warn(`⚠️ 任务 ${task.id} 失败`)
             } else {
-              updateTaskContent(task.id, { status })
+              updateTaskContent(task.id, { status, progress })
             }
           }
-        } catch (e) {
+        } catch (e: any) {
           console.error('❌ 任务轮询失败：', e)
-          // toast.error(`生成失败 ${e.message || e}`)
-          updateTaskContent(task.id, { status: 'FAILED' })
-          // removeTask(task.id)
+          updateTaskContent(task.id, {
+            status: 'FAILED',
+            progress: {
+              ...(task.progress || {}),
+              message: '任务轮询失败',
+              detail: e?.msg || e?.message || '无法获取任务状态',
+              source: 'system',
+              error: { reason_code: 'POLLING_ERROR', retryable: true },
+            },
+          })
         }
       }
     }, interval)

@@ -3,18 +3,14 @@ import logging
 import os
 import re
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Tuple, Union, Any
+from typing import Dict, List, Optional, Tuple, Union, Any
 
-from fastapi import HTTPException
 from pydantic import HttpUrl
 from dotenv import load_dotenv
 
 from app.downloaders.base import Downloader
-from app.downloaders.bilibili_downloader import BilibiliDownloader
-from app.downloaders.douyin_downloader import DouyinDownloader
-from app.downloaders.local_downloader import LocalDownloader
-from app.downloaders.youtube_downloader import YoutubeDownloader
 from app.db.video_task_dao import delete_task_by_video, insert_video_task
 from app.enmus.exception import NoteErrorEnum, ProviderErrorEnum
 from app.enmus.task_status_enums import TaskStatus
@@ -22,18 +18,25 @@ from app.enmus.note_enums import DownloadQuality
 from app.exceptions.note import NoteError
 from app.exceptions.provider import ProviderError
 from app.gpt.base import GPT
+from app.gpt.context_budget import estimate_tokens, is_overflow, resolve_context_limit
 from app.gpt.gpt_factory import GPTFactory
-from app.models.audio_model import AudioDownloadResult
+from app.gpt.prompt import (
+    FORMAL_TRANSCRIPT_STYLE_AUTO,
+    FORMAL_TRANSCRIPT_STYLE_LEAD_PLUS_SUPPORT,
+    FORMAL_TRANSCRIPT_STYLE_MULTI_DIALOGUE,
+    FORMAL_TRANSCRIPT_STYLE_SINGLE_NARRATION,
+)
 from app.models.gpt_model import GPTSource
 from app.models.model_config import ModelConfig
 from app.models.notes_model import AudioDownloadResult, NoteResult
-from app.models.transcriber_model import TranscriptResult, TranscriptSegment
+from app.models.transcriber_model import TranscriptResult, TranscriptSegment, SubtitleFetchResult
 from app.services.constant import SUPPORT_PLATFORM_MAP
 from app.services.provider import ProviderService
 from app.transcriber.base import Transcriber
 from app.transcriber.transcriber_provider import get_transcriber, _transcribers
 from app.utils.note_helper import replace_content_markers
-from app.utils.status_code import StatusCode
+from app.utils.task_assets import get_task_assets_dir, get_task_note_path
+from app.utils.formal_transcript import sanitize_formal_transcript_body
 from app.utils.video_helper import generate_screenshot
 from app.utils.video_reader import VideoReader
 
@@ -50,13 +53,25 @@ BACKEND_BASE_URL = f"{API_BASE_URL}:{BACKEND_PORT}"
 # 输出目录（用于缓存音频、转写、Markdown 文件，以及存储截图）
 NOTE_OUTPUT_DIR = Path(os.getenv("NOTE_OUTPUT_DIR", "note_results"))
 NOTE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-IMAGE_OUTPUT_DIR = os.getenv("OUT_DIR", "./static/screenshots")
-# 图片基础 URL（用于生成 Markdown 中的图片链接，需前端静态目录对应）
-IMAGE_BASE_URL = os.getenv("IMAGE_BASE_URL", "/static/screenshots")
 
 # 日志配置
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+STATUS_STEP_ORDER = [
+    TaskStatus.PENDING.value,
+    TaskStatus.PARSING.value,
+    TaskStatus.DOWNLOADING.value,
+    TaskStatus.TRANSCRIBING.value,
+    TaskStatus.SUMMARIZING.value,
+    TaskStatus.FORMATTING.value,
+    TaskStatus.SAVING.value,
+    TaskStatus.SUCCESS.value,
+]
+STATUS_EVENTS_LIMIT = 30
+FORMAL_TRANSCRIPT_OUTPUT_RESERVE = int(os.getenv("FORMAL_TRANSCRIPT_OUTPUT_RESERVE", "4000"))
+FORMAL_TRANSCRIPT_CHUNK_TARGET = int(os.getenv("FORMAL_TRANSCRIPT_CHUNK_TARGET", "6000"))
+FORMAL_TRANSCRIPT_MERGE_TARGET = int(os.getenv("FORMAL_TRANSCRIPT_MERGE_TARGET", "8000"))
 
 
 class NoteGenerator:
@@ -69,10 +84,10 @@ class NoteGenerator:
         self.model_size: str = "base"
         self.device: Optional[str] = None
         self.transcriber_type: str = os.getenv("TRANSCRIBER_TYPE", "fast-whisper")
-        self.transcriber: Transcriber = self._init_transcriber()
+        self.transcriber: Optional[Transcriber] = None
         self.video_path: Optional[Path] = None
         self.video_img_urls=[]
-        logger.info("NoteGenerator 初始化完成")
+        logger.info("NoteGenerator 初始化完成（转写器懒加载）")
 
 
     # ---------------- 公有方法 ----------------
@@ -90,10 +105,12 @@ class NoteGenerator:
         _format: Optional[List[str]] = None,
         style: Optional[str] = None,
         extras: Optional[str] = None,
+        formal_transcript_style: str = "auto",
         output_path: Optional[str] = None,
         video_understanding: bool = False,
         video_interval: int = 0,
         grid_size: Optional[List[int]] = None,
+        force_refresh_transcript: bool = False,
     ) -> NoteResult | None:
         """
         主流程：按步骤依次下载、转写、GPT 总结、截图/链接处理、存库、返回 NoteResult。
@@ -120,45 +137,81 @@ class NoteGenerator:
 
         try:
             logger.info(f"开始生成笔记 (task_id={task_id})")
-            self._update_status(task_id, TaskStatus.PARSING)
+            self._update_status(
+                task_id,
+                TaskStatus.PARSING,
+                message="解析链接",
+                detail="正在解析链接并初始化任务",
+                source="system",
+            )
 
             # 获取下载器与 GPT 实例
 
             downloader = self._get_downloader(platform)
             gpt = self._get_gpt(model_name, provider_id)
+            self._update_status(
+                task_id,
+                TaskStatus.PARSING,
+                message="解析链接",
+                detail=f"平台识别为 {platform}，已准备下载器与模型",
+                source="system",
+            )
 
             # 缓存文件路径
             audio_cache_file = NOTE_OUTPUT_DIR / f"{task_id}_audio.json"
             transcript_cache_file = NOTE_OUTPUT_DIR / f"{task_id}_transcript.json"
             markdown_cache_file = NOTE_OUTPUT_DIR / f"{task_id}_markdown.md"
-            print(audio_cache_file)
-            # 1. 下载音频/视频
-            audio_meta = self._download_media(
-                downloader=downloader,
-                video_url=video_url,
-                quality=quality,
-                audio_cache_file=audio_cache_file,
-                status_phase=TaskStatus.DOWNLOADING,
-                platform=platform,
-                output_path=output_path,
-                screenshot=screenshot,
-                video_understanding=video_understanding,
-                video_interval=video_interval,
-                grid_size=grid_size,
-            )
-
-            # 2. 获取字幕/转写文字
-            # 优先尝试获取平台字幕，没有再 fallback 到音频转写
+            # 1. 先尝试平台字幕（命中则跳过音频下载）
             transcript = self._get_transcript(
                 downloader=downloader,
                 video_url=video_url,
-                audio_file=audio_meta.file_path,
+                audio_file=None,
                 transcript_cache_file=transcript_cache_file,
                 status_phase=TaskStatus.TRANSCRIBING,
                 task_id=task_id,
+                force_refresh=force_refresh_transcript,
+                allow_asr_fallback=False,
             )
 
-            # 3. GPT 总结
+            # 2. 根据字幕命中情况决定是否下载音频
+            if transcript is None:
+                audio_meta = self._download_media(
+                    downloader=downloader,
+                    video_url=video_url,
+                    quality=quality,
+                    audio_cache_file=audio_cache_file,
+                    status_phase=TaskStatus.DOWNLOADING,
+                    platform=platform,
+                    output_path=output_path,
+                    screenshot=screenshot,
+                    video_understanding=video_understanding,
+                    video_interval=video_interval,
+                    grid_size=grid_size,
+                    download_audio=True,
+                )
+                transcript = self._transcribe_audio(
+                    audio_file=audio_meta.file_path,
+                    transcript_cache_file=transcript_cache_file,
+                    status_phase=TaskStatus.TRANSCRIBING,
+                    force_refresh=force_refresh_transcript,
+                )
+            else:
+                audio_meta = self._download_media(
+                    downloader=downloader,
+                    video_url=video_url,
+                    quality=quality,
+                    audio_cache_file=audio_cache_file,
+                    status_phase=TaskStatus.DOWNLOADING,
+                    platform=platform,
+                    output_path=output_path,
+                    screenshot=screenshot,
+                    video_understanding=video_understanding,
+                    video_interval=video_interval,
+                    grid_size=grid_size,
+                    download_audio=False,
+                )
+
+            # 3. GPT 生成
             markdown = self._summarize_text(
                 audio_meta=audio_meta,
                 transcript=transcript,
@@ -169,31 +222,63 @@ class NoteGenerator:
                 formats=_format or [],
                 style=style,
                 extras=extras,
+                formal_transcript_style=formal_transcript_style,
                 video_img_urls=self.video_img_urls,
+                task_id=task_id,
             )
 
             # 4. 截图 & 链接替换
             if _format:
+                self._update_status(
+                    task_id,
+                    TaskStatus.FORMATTING,
+                    message="格式化内容",
+                    detail="正在处理截图与跳转链接",
+                    source="system",
+                )
                 markdown = self._post_process_markdown(
                     markdown=markdown,
                     video_path=self.video_path,
                     formats=_format,
                     audio_meta=audio_meta,
                     platform=platform,
+                    task_id=task_id,
                 )
 
-            # 5. 保存记录到数据库
-            self._update_status(task_id, TaskStatus.SAVING)
+            # 5. 同步写入每任务目录中的 note.md
+            self._update_status(
+                task_id,
+                TaskStatus.SAVING,
+                message="保存结果",
+                detail="正在写入 Markdown 文件",
+                source="system",
+            )
+            self._save_task_markdown(task_id=task_id, markdown=markdown)
+
+            # 6. 保存记录到数据库
+            self._update_status(
+                task_id,
+                TaskStatus.SAVING,
+                message="保存结果",
+                detail="正在保存任务元数据",
+                source="system",
+            )
             self._save_metadata(video_id=audio_meta.video_id, platform=platform, task_id=task_id)
 
-            # 6. 完成
-            self._update_status(task_id, TaskStatus.SUCCESS)
+            # 7. 完成
+            self._update_status(
+                task_id,
+                TaskStatus.SUCCESS,
+                message="任务完成",
+                detail="笔记已生成完成",
+                source="system",
+            )
             logger.info(f"笔记生成成功 (task_id={task_id})")
             return NoteResult(markdown=markdown, transcript=transcript, audio_meta=audio_meta)
 
         except Exception as exc:
             logger.error(f"生成笔记流程异常 (task_id={task_id})：{exc}", exc_info=True)
-            self._update_status(task_id, TaskStatus.FAILED, message=str(exc))
+            self._handle_exception(task_id, exc)
             return None
 
     @staticmethod
@@ -214,12 +299,18 @@ class NoteGenerator:
         """
         根据环境变量 TRANSCRIBER_TYPE 动态获取并实例化转写器
         """
-        if self.transcriber_type not in _transcribers:
+        supported_types = {item.value for item in _transcribers}
+        if self.transcriber_type not in supported_types:
             logger.error(f"未找到支持的转写器：{self.transcriber_type}")
             raise Exception(f"不支持的转写器：{self.transcriber_type}")
 
         logger.info(f"使用转写器：{self.transcriber_type}")
         return get_transcriber(transcriber_type=self.transcriber_type)
+
+    def _ensure_transcriber(self) -> Transcriber:
+        if self.transcriber is None:
+            self.transcriber = self._init_transcriber()
+        return self.transcriber
 
     def _get_gpt(self, model_name: Optional[str], provider_id: Optional[str]) -> GPT:
         """
@@ -265,54 +356,143 @@ class NoteGenerator:
         logger.info(f"使用下载器：{downloader_cls.__class__}")
         return instance
 
-    def _update_status(self, task_id: Optional[str], status: Union[str, TaskStatus], message: Optional[str] = None):
-        """
-        创建或更新 {task_id}.status.json，记录当前任务状态
+    @staticmethod
+    def _status_to_key(status: Union[str, TaskStatus]) -> str:
+        return status.value if isinstance(status, TaskStatus) else status
 
-        :param task_id: 任务唯一 ID
-        :param status: TaskStatus 枚举或自定义状态字符串
-        :param message: 可选消息，用于记录失败原因等
+    @staticmethod
+    def _parse_iso_time(value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        normalized = value.replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+
+    def _build_step_info(self, status_key: str) -> Dict[str, Any]:
+        index = STATUS_STEP_ORDER.index(status_key) + 1 if status_key in STATUS_STEP_ORDER else 0
+        label = TaskStatus.description(TaskStatus(status_key)) if status_key in TaskStatus._value2member_map_ else "未知状态"
+        return {
+            "key": status_key,
+            "label": label,
+            "index": index,
+            "total": len(STATUS_STEP_ORDER),
+        }
+
+    def _status_file_path(self, task_id: str) -> Path:
+        NOTE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        return NOTE_OUTPUT_DIR / f"{task_id}.status.json"
+
+    def _read_status(self, task_id: Optional[str]) -> Dict[str, Any]:
+        if not task_id:
+            return {}
+        status_file = self._status_file_path(task_id)
+        if not status_file.exists():
+            return {}
+        try:
+            return json.loads(status_file.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning(f"读取状态文件失败 (task_id={task_id})：{exc}")
+            return {}
+
+    def _write_status(self, task_id: str, payload: Dict[str, Any]) -> None:
+        status_file = self._status_file_path(task_id)
+        try:
+            temp_file = status_file.with_suffix(".tmp")
+            with temp_file.open("w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            temp_file.replace(status_file)
+        except Exception as exc:
+            logger.error(f"写入状态文件失败 (task_id={task_id})：{exc}")
+
+    def _update_status(
+        self,
+        task_id: Optional[str],
+        status: Union[str, TaskStatus],
+        message: Optional[str] = None,
+        detail: Optional[str] = None,
+        source: str = "system",
+        diagnostics: Optional[Dict[str, Any]] = None,
+        error: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        创建或更新 {task_id}.status.json，记录当前任务状态与进度细节。
         """
         if not task_id:
             return
 
-        NOTE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        status_file = NOTE_OUTPUT_DIR / f"{task_id}.status.json"
-        print(f"写入状态文件: {status_file} 当前状态: {status}")
-        data = {"status": status.value if isinstance(status, TaskStatus) else status}
+        status_key = self._status_to_key(status)
+        now = datetime.now(timezone.utc)
+        now_str = now.isoformat()
+
+        existing = self._read_status(task_id)
+        started_at = existing.get("started_at") or now_str
+        started_time = self._parse_iso_time(started_at) or now
+        elapsed_ms = max(int((now - started_time).total_seconds() * 1000), 0)
+
         if message:
-            data["message"] = message
+            status_message = message
+        elif status_key in TaskStatus._value2member_map_:
+            status_message = TaskStatus.description(TaskStatus(status_key))
+        else:
+            status_message = status_key
+        events = list(existing.get("events") or [])
+        event = {
+            "at": now_str,
+            "status": status_key,
+            "message": status_message,
+            "detail": detail or "",
+            "source": source,
+        }
+        if diagnostics:
+            event["diagnostics"] = diagnostics
+        events.append(event)
 
-        try:
-            # First create a temporary file
-            temp_file = status_file.with_suffix('.tmp')
+        payload = {
+            "status": status_key,
+            "message": status_message,
+            "detail": detail or existing.get("detail", ""),
+            "source": source,
+            "step": self._build_step_info(status_key),
+            "started_at": started_at,
+            "updated_at": now_str,
+            "elapsed_ms": elapsed_ms,
+            "events": events[-STATUS_EVENTS_LIMIT:],
+            "diagnostics": diagnostics if diagnostics is not None else existing.get("diagnostics", {}),
+            "task_id": task_id,
+        }
+        if error is not None:
+            payload["error"] = error
 
-            # Write to temporary file
-            with temp_file.open('w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+        self._write_status(task_id, payload)
 
-            # Atomic rename operation
-            temp_file.replace(status_file)
-
-            print(f"状态文件写入成功: {status_file}")
-        except Exception as e:
-            logger.error(f"写入状态文件失败 (task_id={task_id})：{e}")
-            # Try to write error to file directly as fallback
-            try:
-                with status_file.open('w', encoding='utf-8') as f:
-                    f.write(f"Error writing status: {str(e)}")
-            except:
-                logger.error(f"写入错误  {e}")
-
-    def _handle_exception(self, task_id, exc):
+    def _handle_exception(
+        self,
+        task_id: Optional[str],
+        exc: Exception,
+        reason_code: str = "INTERNAL_ERROR",
+        diagnostics: Optional[Dict[str, Any]] = None,
+    ):
         logger.error(f"任务异常 (task_id={task_id})", exc_info=True)
-        error_message = getattr(exc, 'detail', str(exc))
+        error_message = getattr(exc, "detail", str(exc))
         if isinstance(error_message, dict):
             try:
                 error_message = json.dumps(error_message, ensure_ascii=False)
-            except:
+            except Exception:
                 error_message = str(error_message)
-        self._update_status(task_id, TaskStatus.FAILED, message=error_message)
+        merged_diagnostics = {"exception_type": exc.__class__.__name__}
+        if diagnostics:
+            merged_diagnostics.update(diagnostics)
+        self._update_status(
+            task_id=task_id,
+            status=TaskStatus.FAILED,
+            message="任务失败",
+            detail=str(error_message),
+            source="system",
+            diagnostics=merged_diagnostics,
+            error={"reason_code": reason_code, "retryable": True},
+        )
 
     def _download_media(
         self,
@@ -327,11 +507,12 @@ class NoteGenerator:
         video_understanding: bool,
         video_interval: int,
         grid_size: List[int],
+        download_audio: bool = True,
     ) -> AudioDownloadResult | None:
         """
-        1. 检查音频缓存；若不存在，则根据需要下载音频或视频（若需截图/可视化）。
-        2. 如果需要视频，则先下载视频并生成缩略图集，再下载音频。
-        3. 返回 AudioDownloadResult
+        1. 根据需要下载视频（用于截图/多模态理解）。
+        2. 读取音频缓存；若无缓存则按配置选择仅取元信息或下载音频。
+        3. 返回 AudioDownloadResult。
 
         :param downloader: Downloader 实例
         :param video_url: 视频/音频链接
@@ -344,17 +525,29 @@ class NoteGenerator:
         :param video_understanding: 是否需要生成缩略图
         :param video_interval: 视频截帧间隔
         :param grid_size: 缩略图网格尺寸
+        :param download_audio: 是否强制下载音频（False 时优先只取元信息）
         :return: AudioDownloadResult 对象
         """
         task_id = audio_cache_file.stem.split("_")[0]
-        self._update_status(task_id, status_phase)
-
-
+        self._update_status(
+            task_id,
+            status_phase,
+            message="下载资源",
+            detail="正在准备下载音频/视频",
+            source="download",
+        )
 
         # 判断是否需要下载视频
         need_video = screenshot or video_understanding
         if need_video:
             try:
+                self._update_status(
+                    task_id,
+                    status_phase,
+                    message="下载资源",
+                    detail="正在下载视频用于截图/多模态理解",
+                    source="download",
+                )
                 logger.info("开始下载视频")
                 video_path_str = downloader.download_video(video_url)
                 self.video_path = Path(video_path_str)
@@ -370,23 +563,91 @@ class NoteGenerator:
                         unit_height=720,
                         save_quality=90,
                     ).run()
+                    self._update_status(
+                        task_id,
+                        status_phase,
+                        message="下载资源",
+                        detail=f"视频下载完成，已生成 {len(self.video_img_urls)} 组拼图",
+                        source="download",
+                    )
                 else:
                     logger.info("未指定 grid_size，跳过缩略图生成")
+                    self._update_status(
+                        task_id,
+                        status_phase,
+                        message="下载资源",
+                        detail="视频下载完成，未启用拼图生成",
+                        source="download",
+                    )
             except Exception as exc:
                 logger.error(f"视频下载失败：{exc}")
 
-                self._handle_exception(task_id, exc)
+                self._handle_exception(task_id, exc, reason_code="VIDEO_DOWNLOAD_FAILED")
                 raise
         # 已有缓存，尝试加载
         if audio_cache_file.exists():
             logger.info(f"检测到音频缓存 ({audio_cache_file})，直接读取")
             try:
                 data = json.loads(audio_cache_file.read_text(encoding="utf-8"))
+                self._update_status(
+                    task_id,
+                    status_phase,
+                    message="下载资源",
+                    detail="命中音频缓存，跳过下载",
+                    source="cache",
+                )
                 return AudioDownloadResult(**data)
             except Exception as e:
                 logger.warning(f"读取音频缓存失败，将重新下载：{e}")
+
+        if not download_audio:
+            try:
+                self._update_status(
+                    task_id,
+                    status_phase,
+                    message="下载资源",
+                    detail="字幕已命中，跳过音频下载，正在提取媒体元信息",
+                    source="download",
+                )
+                media_info = downloader.get_media_info(video_url=video_url, output_dir=output_path)
+                if media_info:
+                    audio_cache_file.write_text(
+                        json.dumps(asdict(media_info), ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    self._update_status(
+                        task_id,
+                        status_phase,
+                        message="下载资源",
+                        detail="已提取媒体元信息，未下载音频",
+                        source="download",
+                    )
+                    return media_info
+                self._update_status(
+                    task_id,
+                    status_phase,
+                    message="下载资源",
+                    detail="媒体元信息提取失败，降级为音频下载",
+                    source="download",
+                )
+            except Exception as exc:
+                logger.warning(f"媒体元信息提取失败，降级下载音频: {exc}")
+                self._update_status(
+                    task_id,
+                    status_phase,
+                    message="下载资源",
+                    detail=f"媒体元信息提取失败，降级为音频下载：{exc}",
+                    source="download",
+                )
         # 下载音频
         try:
+            self._update_status(
+                task_id,
+                status_phase,
+                message="下载资源",
+                detail="正在下载音频",
+                source="download",
+            )
             logger.info("开始下载音频")
             audio = downloader.download(
                 video_url=video_url,
@@ -397,10 +658,17 @@ class NoteGenerator:
             # 缓存 audio 元信息到本地 JSON
             audio_cache_file.write_text(json.dumps(asdict(audio), ensure_ascii=False, indent=2), encoding="utf-8")
             logger.info(f"音频下载并缓存成功 ({audio_cache_file})")
+            self._update_status(
+                task_id,
+                status_phase,
+                message="下载资源",
+                detail="音频下载完成",
+                source="download",
+            )
             return audio
         except Exception as exc:
             logger.error(f"音频下载失败：{exc}")
-            self._handle_exception(task_id, exc)
+            self._handle_exception(task_id, exc, reason_code="AUDIO_DOWNLOAD_FAILED")
             raise
 
 
@@ -408,10 +676,12 @@ class NoteGenerator:
         self,
         downloader: Downloader,
         video_url: str,
-        audio_file: str,
+        audio_file: Optional[str],
         transcript_cache_file: Path,
         status_phase: TaskStatus,
         task_id: Optional[str] = None,
+        force_refresh: bool = False,
+        allow_asr_fallback: bool = True,
     ) -> TranscriptResult | None:
         """
         优先获取平台字幕，没有则 fallback 到音频转写
@@ -422,24 +692,58 @@ class NoteGenerator:
         :param transcript_cache_file: 缓存文件路径
         :param status_phase: 状态枚举
         :param task_id: 任务 ID
+        :param allow_asr_fallback: 是否允许在字幕失败后回退 ASR
         :return: TranscriptResult 对象
         """
-        self._update_status(task_id, status_phase)
+        self._update_status(
+            task_id,
+            status_phase,
+            message="获取字幕/转写",
+            detail="准备获取转写文本",
+            source="system",
+        )
 
         # 已有缓存，直接返回
-        if transcript_cache_file.exists():
+        if transcript_cache_file.exists() and not force_refresh:
             logger.info(f"检测到转写缓存 ({transcript_cache_file})，尝试读取")
             try:
                 data = json.loads(transcript_cache_file.read_text(encoding="utf-8"))
                 segments = [TranscriptSegment(**seg) for seg in data.get("segments", [])]
+                self._update_status(
+                    task_id,
+                    status_phase,
+                    message="获取字幕/转写",
+                    detail="命中转写缓存，跳过字幕与ASR流程",
+                    source="cache",
+                )
                 return TranscriptResult(language=data.get("language"), full_text=data["full_text"], segments=segments)
             except Exception as e:
                 logger.warning(f"加载转写缓存失败，将重新获取：{e}")
 
         # 1. 先尝试获取平台字幕
         logger.info("尝试获取平台字幕...")
+        self._update_status(
+            task_id,
+            status_phase,
+            message="获取字幕/转写",
+            detail="正在尝试平台字幕",
+            source="subtitle",
+        )
         try:
-            transcript = downloader.download_subtitles(video_url)
+            subtitle_result = downloader.download_subtitles(video_url)
+            if isinstance(subtitle_result, TranscriptResult):
+                subtitle_result = SubtitleFetchResult(
+                    transcript=subtitle_result,
+                    outcome="success",
+                    message="使用平台字幕",
+                )
+            elif subtitle_result is None:
+                subtitle_result = SubtitleFetchResult(
+                    outcome="unavailable",
+                    reason_code="SUBTITLE_NOT_AVAILABLE",
+                    message="平台无可用字幕",
+                )
+            transcript = subtitle_result.transcript if subtitle_result else None
             if transcript and transcript.segments:
                 logger.info(f"成功获取平台字幕，共 {len(transcript.segments)} 段")
                 # 缓存结果
@@ -447,17 +751,52 @@ class NoteGenerator:
                     json.dumps(asdict(transcript), ensure_ascii=False, indent=2),
                     encoding="utf-8"
                 )
+                self._update_status(
+                    task_id,
+                    status_phase,
+                    message="获取字幕/转写",
+                    detail=f"平台字幕获取成功，共 {len(transcript.segments)} 段",
+                    source="subtitle",
+                    diagnostics=getattr(subtitle_result, "diagnostics", None),
+                )
                 return transcript
-            else:
-                logger.info("平台无可用字幕，将使用音频转写")
+
+            subtitle_message = (subtitle_result.message if subtitle_result else None) or "平台无可用字幕"
+            subtitle_reason_code = getattr(subtitle_result, "reason_code", None)
+            subtitle_diagnostics = getattr(subtitle_result, "diagnostics", None)
+            logger.info(f"{subtitle_message}，将使用音频转写")
+            fallback_text = "准备下载音频并转写" if not allow_asr_fallback else "回退到音频转写"
+            self._update_status(
+                task_id,
+                status_phase,
+                message="获取字幕/转写",
+                detail=f"{subtitle_message}，{fallback_text}",
+                source="subtitle",
+                diagnostics=subtitle_diagnostics or {"reason_code": subtitle_reason_code},
+            )
         except Exception as e:
             logger.warning(f"获取平台字幕失败: {e}，将使用音频转写")
+            fallback_text = "准备下载音频并转写" if not allow_asr_fallback else "回退到音频转写"
+            self._update_status(
+                task_id,
+                status_phase,
+                message="获取字幕/转写",
+                detail=f"字幕抓取异常，{fallback_text}：{e}",
+                source="subtitle",
+                diagnostics={"reason_code": "SUBTITLE_FETCH_EXCEPTION", "exception": str(e)},
+            )
+
+        if not allow_asr_fallback:
+            return None
+        if not audio_file:
+            raise ValueError("字幕抓取失败且缺少音频文件，无法执行 ASR 回退")
 
         # 2. Fallback 到音频转写
         return self._transcribe_audio(
             audio_file=audio_file,
             transcript_cache_file=transcript_cache_file,
             status_phase=status_phase,
+            force_refresh=force_refresh,
         )
 
     def _transcribe_audio(
@@ -465,6 +804,7 @@ class NoteGenerator:
         audio_file: str,
         transcript_cache_file: Path,
         status_phase: TaskStatus,
+        force_refresh: bool = False,
     ) -> TranscriptResult | None:
         """
         1. 检查转写缓存；若存在则尝试加载，否则调用转写器生成并缓存。
@@ -476,28 +816,56 @@ class NoteGenerator:
         :return: TranscriptResult 对象
         """
         task_id = transcript_cache_file.stem.split("_")[0]
-        self._update_status(task_id, status_phase)
+        self._update_status(
+            task_id,
+            status_phase,
+            message="获取字幕/转写",
+            detail="正在准备音频转写",
+            source="asr",
+        )
 
         # 已有缓存，尝试加载
-        if transcript_cache_file.exists():
+        if transcript_cache_file.exists() and not force_refresh:
             logger.info(f"检测到转写缓存 ({transcript_cache_file})，尝试读取")
             try:
                 data = json.loads(transcript_cache_file.read_text(encoding="utf-8"))
                 segments = [TranscriptSegment(**seg) for seg in data.get("segments", [])]
+                self._update_status(
+                    task_id,
+                    status_phase,
+                    message="获取字幕/转写",
+                    detail="命中转写缓存，跳过 ASR",
+                    source="cache",
+                )
                 return TranscriptResult(language=data["language"], full_text=data["full_text"], segments=segments)
             except Exception as e:
                 logger.warning(f"加载转写缓存失败，将重新转写：{e}")
 
         # 调用转写器
         try:
+            self._update_status(
+                task_id,
+                status_phase,
+                message="获取字幕/转写",
+                detail=f"正在执行 {self.transcriber_type} 音频转写",
+                source="asr",
+            )
             logger.info("开始转写音频")
-            transcript = self.transcriber.transcript(file_path=audio_file)
+            transcriber = self._ensure_transcriber()
+            transcript = transcriber.transcript(file_path=audio_file)
             transcript_cache_file.write_text(json.dumps(asdict(transcript), ensure_ascii=False, indent=2), encoding="utf-8")
             logger.info(f"转写并缓存成功 ({transcript_cache_file})")
+            self._update_status(
+                task_id,
+                status_phase,
+                message="获取字幕/转写",
+                detail=f"ASR 转写完成，共 {len(transcript.segments)} 段",
+                source="asr",
+            )
             return transcript
         except Exception as exc:
             logger.error(f"音频转写失败：{exc}")
-            self._handle_exception(task_id, exc)
+            self._handle_exception(task_id, exc, reason_code="ASR_TRANSCRIBE_FAILED")
             raise
 
     def _summarize_text(
@@ -511,7 +879,9 @@ class NoteGenerator:
         formats: List[str],
         style: Optional[str],
         extras: Optional[str],
-            video_img_urls: List[str],
+        formal_transcript_style: str,
+        video_img_urls: List[str],
+        task_id: Optional[str],
     ) -> str | None:
         """
         调用 GPT 对转写结果进行总结，生成 Markdown 文本并缓存。
@@ -527,8 +897,47 @@ class NoteGenerator:
         :param extras: GPT 额外参数
         :return: 生成的 Markdown 字符串
         """
-        task_id = markdown_cache_file.stem
-        self._update_status(task_id, TaskStatus.SUMMARIZING)
+        model_name = getattr(gpt, "model", "") or ""
+        segment_text_for_budget = self._build_segment_text_for_budget(transcript.segments)
+        estimated_tokens = estimate_tokens(
+            f"{audio_meta.title}\n{audio_meta.raw_info.get('tags', '')}\n{segment_text_for_budget}\n{extras or ''}"
+        )
+        context_limit = resolve_context_limit(model_name)
+        include_formal_transcript = "formal_transcript" in formats
+        overflow = include_formal_transcript and is_overflow(
+            estimated_input=estimated_tokens,
+            context_limit=context_limit,
+            reserve_output=FORMAL_TRANSCRIPT_OUTPUT_RESERVE,
+        )
+
+        self._update_status(
+            task_id,
+            TaskStatus.SUMMARIZING,
+            message="总结内容",
+            detail="正在调用大模型生成笔记",
+            source="gpt",
+            diagnostics={
+                "formal_transcript_mode": "chunked" if overflow else ("single" if include_formal_transcript else "disabled"),
+                "estimated_tokens": estimated_tokens,
+                "context_limit": context_limit,
+            },
+        )
+
+        effective_formats = list(formats or [])
+        if overflow:
+            effective_formats = [item for item in effective_formats if item != "formal_transcript"]
+            self._update_status(
+                task_id,
+                TaskStatus.SUMMARIZING,
+                message="总结内容",
+                detail="检测到正式文稿上下文超限，切换为分块生成",
+                source="gpt",
+                diagnostics={
+                    "formal_transcript_mode": "chunked",
+                    "estimated_tokens": estimated_tokens,
+                    "context_limit": context_limit,
+                },
+            )
 
         source = GPTSource(
             title=audio_meta.title,
@@ -537,20 +946,389 @@ class NoteGenerator:
             screenshot=screenshot,
             video_img_urls=video_img_urls,
             link=link,
-            _format=formats,
+            _format=effective_formats,
             style=style,
             extras=extras,
+            formal_transcript_style=formal_transcript_style,
         )
 
         try:
             markdown = gpt.summarize(source)
+
+            formal_section_detected = False
+            chunk_count = 0
+            if include_formal_transcript and overflow:
+                formal_text, chunk_count = self._generate_formal_transcript_chunked(
+                    gpt=gpt,
+                    transcript=transcript,
+                    title=audio_meta.title,
+                    task_id=task_id,
+                    context_limit=context_limit,
+                    formal_transcript_style=formal_transcript_style,
+                )
+                markdown = self._append_formal_transcript_at_end(markdown=markdown, formal_text=formal_text)
+                formal_section_detected = True
+            elif include_formal_transcript:
+                markdown, formal_section_detected = self._ensure_formal_transcript_at_end(markdown)
+
             markdown_cache_file.write_text(markdown, encoding="utf-8")
             logger.info(f"GPT 总结并缓存成功 ({markdown_cache_file})")
+
+            diagnostics = {
+                "formal_transcript_mode": "chunked" if overflow else ("single" if include_formal_transcript else "disabled"),
+                "estimated_tokens": estimated_tokens,
+                "context_limit": context_limit,
+                "formal_section_detected": formal_section_detected,
+            }
+            if chunk_count:
+                diagnostics["chunk_count"] = chunk_count
+
+            self._update_status(
+                task_id,
+                TaskStatus.SUMMARIZING,
+                message="总结内容",
+                detail="大模型总结完成",
+                source="gpt",
+                diagnostics=diagnostics,
+            )
             return markdown
         except Exception as exc:
             logger.error(f"GPT 总结失败：{exc}")
-            self._handle_exception(task_id, exc)
+            self._handle_exception(task_id, exc, reason_code="GPT_SUMMARY_FAILED")
             raise
+
+    @staticmethod
+    def _format_mmss(seconds: float) -> str:
+        total_seconds = max(int(seconds), 0)
+        minutes = total_seconds // 60
+        remaining_seconds = total_seconds % 60
+        return f"{minutes:02d}:{remaining_seconds:02d}"
+
+    def _build_segment_text_for_budget(self, segments: List[TranscriptSegment]) -> str:
+        lines = []
+        for seg in segments:
+            text = (seg.text or "").strip()
+            if not text:
+                continue
+            lines.append(f"{self._format_mmss(seg.start)} - {text}")
+        return "\n".join(lines)
+
+    def _chunk_transcript_segments(
+        self,
+        segments: List[TranscriptSegment],
+        target_tokens: int,
+    ) -> List[List[TranscriptSegment]]:
+        safe_target = max(target_tokens, 1000)
+        chunks: List[List[TranscriptSegment]] = []
+        current_chunk: List[TranscriptSegment] = []
+        current_tokens = 0
+
+        for seg in segments:
+            seg_text = (seg.text or "").strip()
+            if not seg_text:
+                continue
+            seg_line = f"{self._format_mmss(seg.start)} - {seg_text}"
+            seg_tokens = estimate_tokens(seg_line) + 20
+            if current_chunk and current_tokens + seg_tokens > safe_target:
+                chunks.append(current_chunk)
+                current_chunk = []
+                current_tokens = 0
+            current_chunk.append(seg)
+            current_tokens += seg_tokens
+
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        return chunks or [segments]
+
+    def _build_formal_chunk_prompt(
+        self,
+        title: str,
+        chunk_text: str,
+        chunk_index: int,
+        chunk_count: int,
+        formal_transcript_style: str,
+    ) -> str:
+        style_key = (formal_transcript_style or "auto").strip().lower()
+        style_map = {
+            "auto": FORMAL_TRANSCRIPT_STYLE_AUTO,
+            "single_narration": FORMAL_TRANSCRIPT_STYLE_SINGLE_NARRATION,
+            "lead_plus_support": FORMAL_TRANSCRIPT_STYLE_LEAD_PLUS_SUPPORT,
+            "multi_dialogue": FORMAL_TRANSCRIPT_STYLE_MULTI_DIALOGUE,
+        }
+        style_block = style_map.get(style_key, FORMAL_TRANSCRIPT_STYLE_AUTO)
+        return f"""
+你是专业中文编辑。请对下面的口语化转写生成“正式文稿”的一部分（将被拼接到 `## 正式文稿` 章节中）。
+
+视频标题：{title}
+当前片段：第 {chunk_index}/{chunk_count} 块
+
+总体要求（高优先级）：
+1. 不是总结；按原字幕逻辑改写为可读文稿，尽量保留主要内容、顺序与细节（事实/术语/数字/结论/例子/因果链路）。
+2. 中度润色：修正病句与重复赘词、清理口头禅/语气词；不得杜撰、不得新增原文没有的信息；不要改写成提纲或摘要。
+3. 多讲述者：优先使用可识别角色名（主持人/嘉宾/旁白/采访者等），否则使用“讲述者1/2/3...”兜底；不确定是否换人时保守延续上一讲述者；抢话/被打断按时间顺序线性还原，必要时用极短提示（如“（打断）”“（接话）”）。
+4. 非语音信息：删除无意义噪声词；仅保留影响理解的舞台信息（如[笑]/[音乐]/[停顿]等）。
+5. 禁止时间标记：不要输出 `*Content-[mm:ss]`、`*Screenshot-[mm:ss]`、`[mm:ss]`、以及 `mm:ss -` 开头的行等任何时间戳形式。
+6. 输出形态：只输出正文段落（可带“角色名：/讲述者N：”作为段首），不要标题、列表、表格、代码块。
+
+样式约束：
+{style_block}
+
+转写内容：
+---
+{chunk_text}
+---
+""".strip()
+
+    def _build_formal_merge_prompt(
+        self,
+        title: str,
+        part_texts: List[str],
+        round_index: int,
+        group_index: int,
+        group_count: int,
+        formal_transcript_style: str,
+    ) -> str:
+        style_key = (formal_transcript_style or "auto").strip().lower()
+        style_map = {
+            "auto": FORMAL_TRANSCRIPT_STYLE_AUTO,
+            "single_narration": FORMAL_TRANSCRIPT_STYLE_SINGLE_NARRATION,
+            "lead_plus_support": FORMAL_TRANSCRIPT_STYLE_LEAD_PLUS_SUPPORT,
+            "multi_dialogue": FORMAL_TRANSCRIPT_STYLE_MULTI_DIALOGUE,
+        }
+        style_block = style_map.get(style_key, FORMAL_TRANSCRIPT_STYLE_AUTO)
+        merged_source = "\n\n".join(
+            [f"[片段{i}]\n{text}" for i, text in enumerate(part_texts, start=1)]
+        )
+        return f"""
+你是专业中文编辑。请将以下多段“正式文稿片段”进行拼接润色，生成统一连贯的正式文稿正文（将放入 `## 正式文稿` 章节中）。
+
+视频标题：{title}
+合并轮次：第 {round_index} 轮
+当前分组：第 {group_index}/{group_count} 组
+
+要求（高优先级）：
+1. 不遗漏事实、数字、术语和结论，不新增观点与结论。
+2. 保持原始内容顺序与信息密度，仅做去重、断句与句间衔接；禁止生成总结式、提纲式输出。
+3. 讲述者标签需全局一致：优先角色名；无法判断则用“讲述者1/2/3...”兜底；如不同片段对同一人标签不一致，合并时尽量归一；不确定时不要强行合并或改写；不要在后文改变同一人的编号。
+4. 非语音信息：删除无意义噪声词；仅保留影响理解的舞台信息（如[笑]/[音乐]/[停顿]等）。
+5. 禁止时间标记：删除/避免任何 `*Content-[mm:ss]`、`*Screenshot-[mm:ss]`、`[mm:ss]`、以及 `mm:ss -` 开头的行等形式。
+6. 只输出合并后的正文段落，不要标题、列表、表格、代码块。
+
+样式约束：
+{style_block}
+
+待合并内容：
+---
+{merged_source}
+---
+""".strip()
+
+    def _group_text_by_token_budget(self, texts: List[str], token_budget: int) -> List[List[str]]:
+        safe_budget = max(token_budget, 1200)
+        groups: List[List[str]] = []
+        current_group: List[str] = []
+        current_tokens = 0
+
+        for text in texts:
+            text_tokens = estimate_tokens(text) + 80
+            if current_group and current_tokens + text_tokens > safe_budget:
+                groups.append(current_group)
+                current_group = []
+                current_tokens = 0
+
+            current_group.append(text)
+            current_tokens += text_tokens
+
+        if current_group:
+            groups.append(current_group)
+
+        # Prevent infinite loop when every group contains exactly one part.
+        if len(groups) == len(texts) and len(texts) > 1:
+            regrouped: List[List[str]] = []
+            for idx in range(0, len(texts), 2):
+                regrouped.append(texts[idx:idx + 2])
+            return regrouped
+
+        return groups
+
+    def _chat_text_with_retry(
+        self,
+        gpt: GPT,
+        prompt: str,
+        max_attempts: int = 2,
+    ) -> str:
+        last_exception: Optional[Exception] = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                content = gpt.chat_text(prompt, temperature=0.2)
+                content = (content or "").strip()
+                if not content:
+                    raise RuntimeError("模型返回空文本")
+                return content
+            except Exception as exc:
+                last_exception = exc
+                logger.warning(f"模型调用失败 (attempt={attempt}/{max_attempts}): {exc}")
+
+        raise RuntimeError("模型调用多次失败") from last_exception
+
+    def _merge_formal_transcript_parts(
+        self,
+        gpt: GPT,
+        title: str,
+        parts: List[str],
+        merge_target: int,
+        formal_transcript_style: str,
+    ) -> str:
+        if not parts:
+            return ""
+
+        round_index = 1
+        current_parts = [part.strip() for part in parts if part and part.strip()]
+        while len(current_parts) > 1:
+            groups = self._group_text_by_token_budget(current_parts, token_budget=merge_target)
+            merged_parts: List[str] = []
+            total_groups = len(groups)
+            for group_index, group in enumerate(groups, start=1):
+                if len(group) == 1:
+                    merged_parts.append(group[0])
+                    continue
+                prompt = self._build_formal_merge_prompt(
+                    title=title,
+                    part_texts=group,
+                    round_index=round_index,
+                    group_index=group_index,
+                    group_count=total_groups,
+                    formal_transcript_style=formal_transcript_style,
+                )
+                merged = self._chat_text_with_retry(gpt=gpt, prompt=prompt, max_attempts=2)
+                merged_parts.append(merged)
+            current_parts = merged_parts
+            round_index += 1
+
+        return current_parts[0]
+
+    def _generate_formal_transcript_chunked(
+        self,
+        gpt: GPT,
+        transcript: TranscriptResult,
+        title: str,
+        task_id: Optional[str],
+        context_limit: int,
+        formal_transcript_style: str,
+    ) -> Tuple[str, int]:
+        chunk_target = min(FORMAL_TRANSCRIPT_CHUNK_TARGET, max(context_limit - FORMAL_TRANSCRIPT_OUTPUT_RESERVE, 1200))
+        merge_target = min(FORMAL_TRANSCRIPT_MERGE_TARGET, max(context_limit - FORMAL_TRANSCRIPT_OUTPUT_RESERVE, 1600))
+        chunks = self._chunk_transcript_segments(transcript.segments, target_tokens=chunk_target)
+        chunk_count = len(chunks)
+        generated_parts: List[str] = []
+
+        for chunk_index, chunk_segments in enumerate(chunks, start=1):
+            self._update_status(
+                task_id,
+                TaskStatus.SUMMARIZING,
+                message="总结内容",
+                detail=f"正式文稿分块生成 {chunk_index}/{chunk_count}",
+                source="gpt",
+                diagnostics={
+                    "formal_transcript_mode": "chunked",
+                    "chunk_count": chunk_count,
+                    "current_chunk": chunk_index,
+                },
+            )
+            chunk_text = self._build_segment_text_for_budget(chunk_segments)
+            prompt = self._build_formal_chunk_prompt(
+                title=title,
+                chunk_text=chunk_text,
+                chunk_index=chunk_index,
+                chunk_count=chunk_count,
+                formal_transcript_style=formal_transcript_style,
+            )
+            try:
+                chunk_content = self._chat_text_with_retry(gpt=gpt, prompt=prompt, max_attempts=2)
+            except Exception as exc:
+                raise RuntimeError(f"正式文稿分块生成失败 (chunk={chunk_index}/{chunk_count}): {exc}") from exc
+            generated_parts.append(chunk_content)
+
+        self._update_status(
+            task_id,
+            TaskStatus.SUMMARIZING,
+            message="总结内容",
+            detail="正式文稿合并润色中",
+            source="gpt",
+            diagnostics={
+                "formal_transcript_mode": "chunked",
+                "chunk_count": chunk_count,
+                "current_chunk": chunk_count,
+            },
+        )
+
+        formal_text = self._merge_formal_transcript_parts(
+            gpt=gpt,
+            title=title,
+            parts=generated_parts,
+            merge_target=merge_target,
+            formal_transcript_style=formal_transcript_style,
+        )
+        return formal_text, chunk_count
+
+    @staticmethod
+    def _extract_formal_transcript_section(markdown: str) -> Tuple[str, Optional[str]]:
+        heading_pattern = re.compile(r"^##\s*正式文稿\s*$", re.MULTILINE)
+        match = heading_pattern.search(markdown or "")
+        if not match:
+            return (markdown or "").strip(), None
+
+        before = (markdown[:match.start()] or "").strip()
+        after_heading = markdown[match.end():]
+        next_h2 = re.search(r"^##\s+.+$", after_heading, re.MULTILINE)
+        if next_h2:
+            formal_section = (after_heading[:next_h2.start()] or "").strip()
+            trailing_content = (after_heading[next_h2.start():] or "").strip()
+        else:
+            formal_section = (after_heading or "").strip()
+            trailing_content = ""
+
+        main_parts = [part for part in (before, trailing_content) if part]
+        main_markdown = "\n\n".join(main_parts).strip()
+        return main_markdown, formal_section
+
+    @staticmethod
+    def _normalize_formal_transcript_body(formal_text: str) -> str:
+        text = (formal_text or "").strip()
+        if not text:
+            return ""
+
+        # Remove optional fenced markdown wrapper.
+        if text.startswith("```") and text.endswith("```"):
+            lines = text.splitlines()
+            if len(lines) >= 2:
+                text = "\n".join(lines[1:-1]).strip()
+
+        text = re.sub(r"^\s*##\s*正式文稿\s*\n?", "", text, count=1)
+        text = NoteGenerator._sanitize_formal_transcript_body(text)
+        return text.strip()
+
+    @staticmethod
+    def _sanitize_formal_transcript_body(formal_text: str) -> str:
+        return sanitize_formal_transcript_body(formal_text)
+
+    def _append_formal_transcript_at_end(self, markdown: str, formal_text: str) -> str:
+        main_markdown, extracted_formal = self._extract_formal_transcript_section(markdown)
+        body = self._normalize_formal_transcript_body(formal_text or extracted_formal or "")
+        if not body:
+            return (main_markdown or markdown or "").strip()
+
+        if main_markdown:
+            return f"{main_markdown}\n\n## 正式文稿\n\n{body}".strip()
+        return f"## 正式文稿\n\n{body}".strip()
+
+    def _ensure_formal_transcript_at_end(self, markdown: str) -> Tuple[str, bool]:
+        main_markdown, extracted_formal = self._extract_formal_transcript_section(markdown)
+        if not extracted_formal:
+            return markdown, False
+        normalized = self._append_formal_transcript_at_end(main_markdown, extracted_formal)
+        return normalized, True
 
     def _post_process_markdown(
         self,
@@ -559,6 +1337,7 @@ class NoteGenerator:
         formats: List[str],
         audio_meta: AudioDownloadResult,
         platform: str,
+        task_id: Optional[str] = None,
     ) -> str:
         """
         对生成的 Markdown 做后期处理：插入截图和/或插入链接。
@@ -570,41 +1349,80 @@ class NoteGenerator:
         :param platform: 平台标识，用于链接替换
         :return: 处理后的 Markdown 字符串
         """
-        if "screenshot" in formats and video_path:
+        if "screenshot" in formats and video_path and task_id:
+            self._update_status(
+                task_id,
+                TaskStatus.FORMATTING,
+                message="格式化内容",
+                detail="正在插入截图",
+                source="system",
+            )
             try:
-                markdown = self._insert_screenshots(markdown, video_path)
+                markdown = self._insert_screenshots(markdown, video_path, task_id=task_id)
             except Exception as exc:
                 logger.warning("截图插入失败，跳过该步骤")
+                self._update_status(
+                    task_id,
+                    TaskStatus.FORMATTING,
+                    message="格式化内容",
+                    detail=f"截图插入失败，已跳过：{exc}",
+                    source="system",
+                )
 
         if "link" in formats:
+            self._update_status(
+                task_id,
+                TaskStatus.FORMATTING,
+                message="格式化内容",
+                detail="正在替换原片跳转链接",
+                source="system",
+            )
             try:
                 markdown = replace_content_markers(markdown, video_id=audio_meta.video_id, platform=platform)
             except Exception as e:
                 logger.warning(f"链接插入失败，跳过该步骤：{e}")
+                self._update_status(
+                    task_id,
+                    TaskStatus.FORMATTING,
+                    message="格式化内容",
+                    detail=f"链接插入失败，已跳过：{e}",
+                    source="system",
+                )
 
         return markdown
 
-    def _insert_screenshots(self, markdown: str, video_path: Path) -> str | None | Any:
+    def _insert_screenshots(self, markdown: str, video_path: Path, task_id: str) -> str:
         """
         扫描 Markdown 文本中所有 Screenshot 标记，并替换为实际生成的截图链接。
 
         :param markdown: 含有 *Screenshot-mm:ss 或 Screenshot-[mm:ss] 标记的 Markdown 文本
         :param video_path: 本地视频文件路径
+        :param task_id: 任务 ID，用于定位任务附件目录
         :return: 替换后的 Markdown 字符串
         """
+        output_dir = get_task_assets_dir(task_id)
         matches: List[Tuple[str, int]] = self._extract_screenshot_timestamps(markdown)
         for idx, (marker, ts) in enumerate(matches):
             try:
-                img_path = generate_screenshot(str(video_path), str(IMAGE_OUTPUT_DIR), ts, idx)
+                img_path = generate_screenshot(str(video_path), str(output_dir), ts, idx)
                 filename = Path(img_path).name
-                # 构建前端可访问的 URL，例如 /static/screenshots/{filename}
-                img_url = f"{IMAGE_BASE_URL.rstrip('/')}/{filename}"
+                # 使用任务内相对路径，支持导出后离线阅读。
+                img_url = f"./assets/{filename}"
                 markdown = markdown.replace(marker, f"![]({img_url})", 1)
             except Exception as exc:
                 logger.error(f"生成截图失败 (timestamp={ts})：{exc}")
-                # self._handle_exception(task_id, exc)
-                return None
+                # 保留原始 marker，不中断整篇笔记生成。
+                continue
         return markdown
+
+    def _save_task_markdown(self, task_id: Optional[str], markdown: Optional[str]) -> None:
+        if not task_id or markdown is None:
+            return
+        try:
+            note_path = get_task_note_path(task_id)
+            note_path.write_text(markdown, encoding="utf-8")
+        except Exception as exc:
+            logger.warning(f"写入任务 note.md 失败 (task_id={task_id})：{exc}")
 
     @staticmethod
     def _extract_screenshot_timestamps(markdown: str) -> List[Tuple[str, int]]:

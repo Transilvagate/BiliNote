@@ -13,17 +13,15 @@ export const HomePage: FC = () => {
 
   const [status, setStatus] = useState<ViewStatus>('idle')
 
-  const content = currentTask?.markdown || ''
-
   useEffect(() => {
     if (!currentTask) {
       setStatus('idle')
-    } else if (currentTask.status === 'PENDING') {
-      setStatus('loading')
     } else if (currentTask.status === 'SUCCESS') {
       setStatus('success')
     } else if (currentTask.status === 'FAILED') {
       setStatus('failed')
+    } else {
+      setStatus('loading')
     }
   }, [currentTask])
 

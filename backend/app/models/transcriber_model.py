@@ -1,6 +1,6 @@
 
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 @dataclass
 class TranscriptSegment:
@@ -14,3 +14,12 @@ class TranscriptResult:
     full_text: str                  # 完整合并后的文本（用于摘要）
     segments: List[TranscriptSegment]  # 分段结构，适合前端显示时间轴字幕等
     raw: Optional[dict] = None      # 原始响应数据，便于调试或平台特性处理
+
+
+@dataclass
+class SubtitleFetchResult:
+    transcript: Optional[TranscriptResult] = None
+    outcome: str = "unavailable"  # success/unavailable/error
+    reason_code: Optional[str] = None
+    message: Optional[str] = None
+    diagnostics: Dict[str, Any] = field(default_factory=dict)

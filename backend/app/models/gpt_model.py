@@ -9,6 +9,7 @@ class GPTSource:
     segment: Union[List[TranscriptSegment], List]
     title: str
     tags:str
+    formal_transcript_style: Optional[str] = None
     screenshot: Optional[bool] = False
     link: Optional[bool] = False
     style: Optional[str] = None

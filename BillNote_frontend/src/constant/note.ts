@@ -12,6 +12,7 @@ export const noteFormats = [
   { label: '原片跳转', value: 'link' },
   { label: '原片截图', value: 'screenshot' },
   { label: 'AI总结', value: 'summary' },
+  { label: '正式文稿', value: 'formal_transcript' },
 ] as const
 
 export const noteStyles = [
@@ -24,6 +25,13 @@ export const noteStyles = [
   { label: '任务导向', value: 'task_oriented' },
   { label: '商业风格', value: 'business' },
   { label: '会议纪要', value: 'meeting_minutes' },
+] as const
+
+export const formalTranscriptStyles = [
+  { label: '自动判定', value: 'auto' },
+  { label: '单人叙述', value: 'single_narration' },
+  { label: '主讲+补充', value: 'lead_plus_support' },
+  { label: '多人对话', value: 'multi_dialogue' },
 ] as const
 
 export const videoPlatforms = [

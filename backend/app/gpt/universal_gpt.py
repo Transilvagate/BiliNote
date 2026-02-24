@@ -37,6 +37,7 @@ class UniversalGPT(GPT):
             _format=kwargs.get('_format'),
             style=kwargs.get('style'),
             extras=kwargs.get('extras'),
+            formal_transcript_style=kwargs.get("formal_transcript_style"),
         )
 
         # ⛳ 组装 content 数组，支持 text + image_url 混合
@@ -63,6 +64,14 @@ class UniversalGPT(GPT):
     def list_models(self):
         return self.client.models.list()
 
+    def chat_text(self, prompt: str, temperature: float = 0.2) -> str:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+        )
+        return response.choices[0].message.content.strip()
+
     def summarize(self, source: GPTSource) -> str:
         self.screenshot = source.screenshot
         self.link = source.link
@@ -75,7 +84,8 @@ class UniversalGPT(GPT):
             video_img_urls=source.video_img_urls,
             _format=source._format,
             style=source.style,
-            extras=source.extras
+            extras=source.extras,
+            formal_transcript_style=source.formal_transcript_style,
         )
         response = self.client.chat.completions.create(
             model=self.model,

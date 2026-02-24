@@ -15,12 +15,12 @@ interface ISettingLayoutProps {
 const SettingLayout = ({ Menu }: ISettingLayoutProps) => {
   return (
     <div
-      className="h-full w-full"
+      className="h-screen w-full"
       style={{
         backgroundColor: 'var(--color-muted)',
       }}
     >
-      <div className="flex flex-1">
+      <div className="flex h-full flex-1">
         {/* 左侧部分：Header + 表单 */}
         <aside className="flex w-[300px] flex-col border-r border-neutral-200 bg-white">
           {/* Header */}
@@ -55,7 +55,7 @@ const SettingLayout = ({ Menu }: ISettingLayoutProps) => {
         </aside>
 
         {/* 右侧预览区域 */}
-        <main className="h-screen flex-1 overflow-hidden">
+        <main className="min-h-0 flex-1 overflow-hidden">
           <Outlet />
         </main>
       </div>

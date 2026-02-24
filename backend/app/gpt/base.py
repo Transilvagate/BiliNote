@@ -15,3 +15,6 @@ class GPT(ABC):
         pass
     def list_models(self):
         pass
+
+    def chat_text(self, prompt: str, temperature: float = 0.2) -> str:
+        raise NotImplementedError("chat_text is not implemented for this GPT provider")

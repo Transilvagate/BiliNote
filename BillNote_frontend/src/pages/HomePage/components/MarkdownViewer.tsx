@@ -1,7 +1,7 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { Button } from '@/components/ui/button.tsx'
-import { Copy, Download, ArrowRight, Play, ExternalLink } from 'lucide-react'
+import { Copy, ArrowRight, Play, ExternalLink, ChevronDown, ChevronUp } from 'lucide-react'
 import { toast } from 'react-hot-toast'
 import Error from '@/components/Lottie/error.tsx'
 import Loading from '@/components/Lottie/Loading.tsx'
@@ -18,6 +18,7 @@ import 'katex/dist/katex.min.css'
 import 'github-markdown-css/github-markdown-light.css'
 import { FC } from 'react'
 import { ScrollArea } from '@/components/ui/scroll-area.tsx'
+import { export_markdown_bundle } from '@/services/note.ts'
 import { useTaskStore } from '@/store/taskStore'
 import { noteStyles } from '@/constant/note.ts'
 import { MarkdownHeader } from '@/pages/HomePage/components/MarkdownHeader.tsx'
@@ -33,7 +34,7 @@ interface VersionNote {
 }
 
 interface MarkdownViewerProps {
-  content: string | VersionNote[]
+  content?: string | VersionNote[]
   status: 'idle' | 'loading' | 'success' | 'failed'
 }
 
@@ -42,26 +43,44 @@ const steps = [
   { label: '下载音频', key: 'DOWNLOADING' },
   { label: '转写文字', key: 'TRANSCRIBING' },
   { label: '总结内容', key: 'SUMMARIZING' },
+  { label: '格式化内容', key: 'FORMATTING' },
+  { label: '保存结果', key: 'SAVING' },
   { label: '保存完成', key: 'SUCCESS' },
 ]
 
 const MarkdownViewer: FC<MarkdownViewerProps> = ({ status }) => {
-  const [copied, setCopied] = useState(false)
   const [currentVerId, setCurrentVerId] = useState<string>('')
   const [selectedContent, setSelectedContent] = useState<string>('')
   const [modelName, setModelName] = useState<string>('')
   const [style, setStyle] = useState<string>('')
   const [createTime, setCreateTime] = useState<string>('')
-  // 确保baseURL没有尾部斜杠
-  const baseURL = (String(import.meta.env.VITE_API_BASE_URL || '').replace('/api','') || '').replace(/\/$/, '')
+  const apiBaseURL = String(import.meta.env.VITE_API_BASE_URL || '/api').replace(/\/$/, '')
+  const backendBaseURL = apiBaseURL.endsWith('/api') ? apiBaseURL.slice(0, -4) : apiBaseURL
   const getCurrentTask = useTaskStore.getState().getCurrentTask
   const currentTask = useTaskStore(state => state.getCurrentTask())
   const taskStatus = currentTask?.status || 'PENDING'
   const retryTask = useTaskStore.getState().retryTask
+  const progress = currentTask?.progress
   const isMultiVersion = Array.isArray(currentTask?.markdown)
   const [showTranscribe, setShowTranscribe] = useState(false)
   const [viewMode, setViewMode] = useState<'map' | 'preview'>('preview')
-  const svgRef = useRef<SVGSVGElement>(null)
+  const [showDiagnostics, setShowDiagnostics] = useState(false)
+
+  const stepForBar = taskStatus === 'PENDING' ? 'PARSING' : taskStatus
+  const progressMessage = progress?.message || '正在处理中'
+  const progressDetail = progress?.detail || '任务已提交，请稍候...'
+  const progressSource = progress?.source || 'system'
+  const elapsedMs = progress?.elapsed_ms || 0
+  const recentEvents = (progress?.events || []).slice(-5).reverse()
+
+  const formatElapsed = (ms: number) => {
+    if (!ms || ms < 1000) return '刚刚开始'
+    const totalSec = Math.floor(ms / 1000)
+    const min = Math.floor(totalSec / 60)
+    const sec = totalSec % 60
+    if (!min) return `${sec}s`
+    return `${min}m ${sec}s`
+  }
   // 多版本内容处理
   useEffect(() => {
     if (!currentTask) return
@@ -69,11 +88,12 @@ const MarkdownViewer: FC<MarkdownViewerProps> = ({ status }) => {
     if (!isMultiVersion) {
       setCurrentVerId('') // 清空旧版本 ID
       setModelName(currentTask.formData.model_name)
-      setStyle(currentTask.formData.style)
+      setStyle(currentTask.formData.style || '')
       setCreateTime(currentTask.createdAt)
-      setSelectedContent(currentTask?.markdown)
+      setSelectedContent(typeof currentTask?.markdown === 'string' ? currentTask.markdown : '')
     } else {
-      const latestVersion = [...currentTask.markdown].sort(
+      const versionList = Array.isArray(currentTask.markdown) ? currentTask.markdown : []
+      const latestVersion = [...versionList].sort(
         (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
       )[0]
 
@@ -85,7 +105,8 @@ const MarkdownViewer: FC<MarkdownViewerProps> = ({ status }) => {
   useEffect(() => {
     if (!currentTask || !isMultiVersion) return
 
-    const currentVer = currentTask.markdown.find(v => v.ver_id === currentVerId)
+    const versionList = Array.isArray(currentTask.markdown) ? currentTask.markdown : []
+    const currentVer = versionList.find(v => v.ver_id === currentVerId)
     if (currentVer) {
       setModelName(currentVer.model_name)
       setStyle(currentVer.style)
@@ -96,60 +117,108 @@ const MarkdownViewer: FC<MarkdownViewerProps> = ({ status }) => {
   const handleCopy = async () => {
     try {
       await navigator.clipboard.writeText(selectedContent)
-      setCopied(true)
       toast.success('已复制到剪贴板')
-      setTimeout(() => setCopied(false), 2000)
     } catch (e) {
       toast.error('复制失败')
     }
   }
-  const alertButton = {
-    id: 'alert',
-    title: '测试警告',
-    content: '⚠️',
-    onClick: () => alert('你点击了自定义按钮！'),
+  const encodeAssetPath = (path: string) => path.split('/').map(encodeURIComponent).join('/')
+
+  const resolveImageSrc = (src?: string) => {
+    if (!src) return src
+    const trimmed = src.trim()
+    if (
+      trimmed.startsWith('http://') ||
+      trimmed.startsWith('https://') ||
+      trimmed.startsWith('data:') ||
+      trimmed.startsWith('blob:')
+    ) {
+      return trimmed
+    }
+
+    if (trimmed.startsWith('./assets/') || trimmed.startsWith('assets/')) {
+      const taskId = currentTask?.id
+      if (!taskId) return trimmed
+      const relativePath = trimmed.replace(/^\.\//, '').replace(/^assets\//, '')
+      return `${apiBaseURL}/tasks/${encodeURIComponent(taskId)}/assets/${encodeAssetPath(relativePath)}`
+    }
+
+    if (trimmed.startsWith('/')) {
+      return `${backendBaseURL}${trimmed}`
+    }
+
+    return trimmed
   }
-  const exportButton = {
-    id: 'export',
-    title: '导出思维导图',
-    content: '⤓',
-    onClick: () => {
-      const svgEl = svgRef.current
-      if (!svgEl) return
-      // 同上面的序列化逻辑
-      const serializer = new XMLSerializer()
-      const source = serializer.serializeToString(svgEl)
-      const blob = new Blob(['<?xml version="1.0" encoding="UTF-8"?>', source], {
-        type: 'image/svg+xml;charset=utf-8',
-      })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = 'mindmap.svg'
-      a.click()
-      URL.revokeObjectURL(url)
-    },
-  }
-  const handleDownload = () => {
+
+  const handleDownload = async () => {
     const task = getCurrentTask()
     const name = task?.audioMeta.title || 'note'
-    const blob = new Blob([selectedContent], { type: 'text/markdown;charset=utf-8' })
-    const link = document.createElement('a')
-    link.href = URL.createObjectURL(blob)
-    link.download = `${name}.md`
-    document.body.appendChild(link)
-    link.click()
-    document.body.removeChild(link)
+    if (!task?.id) {
+      toast.error('任务不存在，无法导出')
+      return
+    }
+    try {
+      const { blob, filename } = await export_markdown_bundle({
+        task_id: task.id,
+        title: name,
+        markdown: selectedContent || '',
+      })
+      const link = document.createElement('a')
+      link.href = URL.createObjectURL(blob)
+      link.download = filename || `${name}.zip`
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      URL.revokeObjectURL(link.href)
+    } catch (error) {
+      console.error('导出失败', error)
+    }
   }
 
   if (status === 'loading') {
     return (
-      <div className="flex h-screen w-full flex-col items-center justify-center space-y-4 text-neutral-500">
-        <StepBar steps={steps} currentStep={taskStatus} />
+      <div className="flex h-screen w-full flex-col items-center justify-center space-y-4 px-6 text-neutral-500">
+        <StepBar steps={steps} currentStep={stepForBar} />
         <Loading className="h-5 w-5" />
-        <div className="text-center text-sm">
-          <p className="text-lg font-bold">正在生成笔记，请稍候…</p>
-          <p className="mt-2 text-xs text-neutral-500">这可能需要几秒钟时间，取决于视频长度</p>
+        <div className="w-full max-w-2xl rounded-lg border bg-white p-4 shadow-sm">
+          <p className="text-lg font-bold text-neutral-800">正在生成笔记，请稍候…</p>
+          <p className="mt-2 text-sm text-neutral-700">
+            {progressMessage} · {progressDetail}
+          </p>
+          <p className="mt-1 text-xs text-neutral-500">
+            数据来源：{progressSource} · 已耗时：{formatElapsed(elapsedMs)}
+          </p>
+
+          <div className="mt-3 border-t pt-3">
+            <button
+              className="flex items-center gap-1 text-xs text-neutral-600 hover:text-neutral-800"
+              onClick={() => setShowDiagnostics(!showDiagnostics)}
+              type="button"
+            >
+              {showDiagnostics ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+              查看技术细节
+            </button>
+            {showDiagnostics && (
+              <div className="mt-2 space-y-2 text-xs text-neutral-600">
+                {recentEvents.length > 0 && (
+                  <div className="space-y-1 rounded bg-neutral-50 p-2">
+                    {recentEvents.map((event, idx) => (
+                      <div key={`${event.at}-${idx}`}>
+                        <span className="font-medium">{event.status}</span>
+                        <span className="ml-2">{event.message}</span>
+                        {event.detail ? <span className="ml-1 text-neutral-500">- {event.detail}</span> : null}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {progress?.diagnostics ? (
+                  <pre className="max-h-32 overflow-auto rounded bg-neutral-100 p-2 text-[11px]">
+                    {JSON.stringify(progress.diagnostics, null, 2)}
+                  </pre>
+                ) : null}
+              </div>
+            )}
+          </div>
         </div>
       </div>
     )
@@ -171,11 +240,39 @@ const MarkdownViewer: FC<MarkdownViewerProps> = ({ status }) => {
     return (
       <div className="flex h-screen w-full flex-col items-center justify-center gap-4 space-y-3">
         <Error />
-        <div className="text-center">
+        <div className="w-full max-w-2xl text-center">
           <p className="text-lg font-bold text-red-500">笔记生成失败</p>
-          <p className="mt-2 mb-2 text-xs text-red-400">请检查后台或稍后再试</p>
+          <p className="mt-2 mb-2 text-xs text-red-400">
+            {progress?.detail || progress?.message || '请检查后台或稍后再试'}
+          </p>
 
-          <Button onClick={() => retryTask(currentTask.id)} size="lg">
+          <div className="mb-3 border-t pt-2 text-left">
+            <button
+              className="flex items-center gap-1 text-xs text-neutral-600 hover:text-neutral-800"
+              onClick={() => setShowDiagnostics(!showDiagnostics)}
+              type="button"
+            >
+              {showDiagnostics ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+              查看技术细节
+            </button>
+            {showDiagnostics && (
+              <div className="mt-2 space-y-2">
+                {progress?.error ? (
+                  <div className="rounded bg-neutral-100 p-2 text-xs text-neutral-700">
+                    错误码：{progress.error.reason_code || 'UNKNOWN'} · 可重试：
+                    {progress.error.retryable ? '是' : '否'}
+                  </div>
+                ) : null}
+                {progress?.diagnostics ? (
+                  <pre className="max-h-36 overflow-auto rounded bg-neutral-100 p-2 text-[11px] text-neutral-700">
+                    {JSON.stringify(progress.diagnostics, null, 2)}
+                  </pre>
+                ) : null}
+              </div>
+            )}
+          </div>
+
+          <Button onClick={() => currentTask?.id && retryTask(currentTask.id)} size="lg">
             重试
           </Button>
         </div>
@@ -308,25 +405,21 @@ const MarkdownViewer: FC<MarkdownViewerProps> = ({ status }) => {
                       },
 
                       // Enhanced image with zoom capability
-                      img: ({ node, ...props }) =>{
-                        // Fix the URL by removing the 'undefined' prefix if it exists
-                        let src = props.src
-                        if (src.startsWith('/')) {
-                          src = baseURL + src
-                        }
-                        props.src = src
-
-                     return(
-                      <div className="my-8 flex justify-center">
-                          <Zoom>
-                            <img
-                              {...props}
-                              className="max-w-full cursor-zoom-in rounded-lg object-cover shadow-md transition-all hover:shadow-lg"
-                              style={{ maxHeight: '500px' }}
-                            />
-                          </Zoom>
-                        </div>
-                      )},
+                      img: ({ node, ...props }) => {
+                        const src = resolveImageSrc(props.src)
+                        return (
+                          <div className="my-8 flex justify-center">
+                            <Zoom>
+                              <img
+                                {...props}
+                                src={src}
+                                className="max-w-full cursor-zoom-in rounded-lg object-cover shadow-md transition-all hover:shadow-lg"
+                                style={{ maxHeight: '500px' }}
+                              />
+                            </Zoom>
+                          </div>
+                        )
+                      },
 
                       // Better strong/bold text
                       strong: ({ children, ...props }) => (

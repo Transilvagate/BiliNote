@@ -36,7 +36,7 @@ import {
 } from '@/components/ui/select.tsx'
 import { Input } from '@/components/ui/input.tsx'
 import { Textarea } from '@/components/ui/textarea.tsx'
-import { noteStyles, noteFormats, videoPlatforms } from '@/constant/note.ts'
+import { formalTranscriptStyles, noteStyles, noteFormats, videoPlatforms } from '@/constant/note.ts'
 import { fetchModels } from '@/services/model.ts'
 import { useNavigate } from 'react-router-dom'
 
@@ -51,6 +51,9 @@ const formSchema = z
     model_name: z.string().nonempty('请选择模型'),
     format: z.array(z.string()).default([]),
     style: z.string().nonempty('请选择笔记生成风格'),
+    formal_transcript_style: z
+      .enum(['auto', 'single_narration', 'lead_plus_support', 'multi_dialogue'])
+      .default('auto'),
     extras: z.string().optional(),
     video_understanding: z.boolean().optional(),
     video_interval: z.coerce.number().min(1).max(30).default(4).optional(),
@@ -144,6 +147,7 @@ const NoteForm = () => {
       quality: 'medium',
       model_name: modelList[0]?.model_name || '',
       style: 'minimal',
+      formal_transcript_style: 'auto',
       video_interval: 4,
       grid_size: [3, 3],
       format: [],
@@ -154,6 +158,7 @@ const NoteForm = () => {
   /* ---- 派生状态（只 watch 一次，提高性能） ---- */
   const platform = useWatch({ control: form.control, name: 'platform' }) as string
   const videoUnderstandingEnabled = useWatch({ control: form.control, name: 'video_understanding' })
+  const selectedFormats = useWatch({ control: form.control, name: 'format' }) as string[]
   const editing = currentTask && currentTask.id
 
   const goModelAdd = () => {
@@ -176,6 +181,7 @@ const NoteForm = () => {
       video_url: formData.video_url || '',
       model_name: formData.model_name || modelList[0]?.model_name || '',
       style: formData.style || 'minimal',
+      formal_transcript_style: formData.formal_transcript_style || 'auto',
       quality: formData.quality || 'medium',
       extras: formData.extras || '',
       screenshot: formData.screenshot ?? false,
@@ -545,6 +551,36 @@ const NoteForm = () => {
               </FormItem>
             )}
           />
+
+          {selectedFormats?.includes('formal_transcript') && (
+            <FormField
+              control={form.control}
+              name="formal_transcript_style"
+              render={({ field }) => (
+                <FormItem>
+                  <SectionHeader
+                    title="正式文稿样式"
+                    tip="默认自动判定；也可手动指定单人/主讲+补充/多人对话"
+                  />
+                  <Select value={field.value} onValueChange={field.onChange} defaultValue={field.value}>
+                    <FormControl>
+                      <SelectTrigger className="w-full min-w-0 truncate">
+                        <SelectValue />
+                      </SelectTrigger>
+                    </FormControl>
+                    <SelectContent>
+                      {formalTranscriptStyles.map(({ label, value }) => (
+                        <SelectItem key={value} value={value}>
+                          {label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          )}
 
           {/* 备注 */}
           <FormField

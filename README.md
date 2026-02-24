@@ -102,6 +102,19 @@ sudo apt install ffmpeg
 
 具体 `fast-whisper` 配置方法，请参考：[fast-whisper 项目地址](http://github.com/SYSTRAN/faster-whisper#requirements)
 
+### 📺 B站字幕（BBDown）
+项目默认使用 `BBDown` 处理 B站登录与字幕下载：
+
+1. 先进入后端容器执行登录：
+```bash
+docker compose exec -it backend BBDown login
+```
+2. 可选执行字幕测试：
+```bash
+docker compose exec -it backend BBDown <B站URL> --sub-only --work-dir /app/data/bbdown --use-cookie-file /app/config/bilibili.cookies.txt
+```
+3. 在网页的下载器设置页可查看 BBDown 状态、命令模板与 Cookie 文件状态。
+
 ### 🐳 使用 Docker 一键部署
 
 确保你已安装 Docker 和 Docker Compose：
