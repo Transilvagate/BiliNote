@@ -13,7 +13,7 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
 
 import { Info, Loader2, Plus } from 'lucide-react'
-import { message, Alert } from 'antd'
+import { Alert, AlertDescription } from '@/components/ui/alert.tsx'
 import { generateNote } from '@/services/note.ts'
 import { uploadFile } from '@/services/upload.ts'
 import { useTaskStore } from '@/store/taskStore'
@@ -57,10 +57,10 @@ const formSchema = z
     extras: z.string().optional(),
     transcript_source: z.enum(['auto', 'bbdown', 'asr']).default('auto'),
     video_understanding: z.boolean().optional(),
-    video_interval: z.coerce.number().min(1).max(30).default(4).optional(),
+    video_interval: z.coerce.number().min(1).max(30).default(6).optional(),
     grid_size: z
       .tuple([z.coerce.number().min(1).max(10), z.coerce.number().min(1).max(10)])
-      .default([3, 3])
+      .default([2, 2])
       .optional(),
   })
   .superRefine(({ video_url, platform }, ctx) => {
@@ -190,8 +190,8 @@ const NoteForm = () => {
       screenshot: formData.screenshot ?? false,
       link: formData.link ?? false,
       video_understanding: formData.video_understanding ?? false,
-      video_interval: formData.video_interval ?? 4,
-      grid_size: formData.grid_size ?? [3, 3],
+      video_interval: formData.video_interval ?? 6,
+      grid_size: formData.grid_size ?? [2, 2],
       format: formData.format ?? [],
     })
   }, [
@@ -560,17 +560,11 @@ const NoteForm = () => {
                 )}
               />
             </div>
-            <Alert
-              closable
-              type="error"
-              message={
-                <div>
-                  <strong>提示：</strong>
-                  <p>视频理解功能必须使用多模态模型。</p>
-                </div>
-              }
-              className="text-sm"
-            />
+            <Alert variant="warning" className="text-sm">
+              <AlertDescription>
+                <strong>提示：</strong>视频理解功能必须使用多模态模型。
+              </AlertDescription>
+            </Alert>
           </div>
 
           {/* 笔记格式 */}

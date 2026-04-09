@@ -1,7 +1,9 @@
 import base64
+import hashlib
 import os
 import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import ffmpeg
 from PIL import Image, ImageDraw, ImageFont
 
@@ -14,6 +16,7 @@ class VideoReader:
                  video_path: str,
                  grid_size=(3, 3),
                  frame_interval=2,
+                 dedupe_enabled=True,
                  unit_width=960,
                  unit_height=540,
                  save_quality=90,
@@ -23,6 +26,7 @@ class VideoReader:
         self.video_path = video_path
         self.grid_size = grid_size
         self.frame_interval = frame_interval
+        self.dedupe_enabled = dedupe_enabled
         self.unit_width = unit_width
         self.unit_height = unit_height
         self.save_quality = save_quality
@@ -30,6 +34,14 @@ class VideoReader:
         self.grid_dir = grid_dir or get_app_dir("grid_output")
         print(f"视频路径：{video_path}",self.frame_dir,self.grid_dir)
         self.font_path = font_path
+
+    @staticmethod
+    def _calculate_file_md5(file_path: str) -> str:
+        hasher = hashlib.md5()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
 
     def format_time(self, seconds: float) -> str:
         mm = int(seconds // 60)
@@ -43,6 +55,18 @@ class VideoReader:
             return mm * 60 + ss
         return float('inf')
 
+    def _extract_single_frame(self, ts: int) -> str | None:
+        """提取单帧，返回输出路径或 None（失败时）。"""
+        time_label = self.format_time(ts)
+        output_path = os.path.join(self.frame_dir, f"frame_{time_label}.jpg")
+        cmd = ["ffmpeg", "-ss", str(ts), "-i", self.video_path, "-frames:v", "1", "-q:v", "2", "-y", output_path,
+               "-hide_banner", "-loglevel", "error"]
+        try:
+            subprocess.run(cmd, check=True)
+            return output_path
+        except subprocess.CalledProcessError:
+            return None
+
     def extract_frames(self, max_frames=1000) -> list[str]:
 
         try:
@@ -50,13 +74,30 @@ class VideoReader:
             duration = float(ffmpeg.probe(self.video_path)["format"]["duration"])
             timestamps = [i for i in range(0, int(duration), self.frame_interval)][:max_frames]
 
+            # 并行提取帧
+            max_workers = min(os.cpu_count() or 4, 8, len(timestamps))
+            frame_results: dict[int, str | None] = {}
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(self._extract_single_frame, ts): ts for ts in timestamps}
+                for future in as_completed(futures):
+                    ts = futures[future]
+                    frame_results[ts] = future.result()
+
+            # 按时间戳顺序整理结果，并进行去重
             image_paths = []
+            last_hash = None
             for ts in timestamps:
-                time_label = self.format_time(ts)
-                output_path = os.path.join(self.frame_dir, f"frame_{time_label}.jpg")
-                cmd = ["ffmpeg", "-ss", str(ts), "-i", self.video_path, "-frames:v", "1", "-q:v", "2", "-y", output_path,
-                       "-hide_banner", "-loglevel", "error"]
-                subprocess.run(cmd, check=True)
+                output_path = frame_results.get(ts)
+                if not output_path or not os.path.exists(output_path):
+                    continue
+
+                if self.dedupe_enabled:
+                    frame_hash = self._calculate_file_md5(output_path)
+                    if frame_hash == last_hash:
+                        os.remove(output_path)
+                        continue
+                    last_hash = frame_hash
+
                 image_paths.append(output_path)
             return image_paths
         except Exception as e:

@@ -20,9 +20,11 @@ export const useTaskPolling = (interval = 3000) => {
         task => task.status != 'SUCCESS' && task.status != 'FAILED'
       )
 
+      // 无活跃任务时跳过轮询
+      if (pendingTasks.length === 0) return
+
       for (const task of pendingTasks) {
         try {
-          console.log('🔄 正在轮询任务：', task.id)
           const res = await get_task_status(task.id)
           const { status } = res
           const progress = {

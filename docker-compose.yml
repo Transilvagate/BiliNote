@@ -5,6 +5,9 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile
+      args:
+        APT_MIRROR: ${APT_MIRROR:-mirrors.tuna.tsinghua.edu.cn}
+        PIP_INDEX: ${PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}
     env_file:
       - .env
     environment:
@@ -14,6 +17,14 @@ services:
       - ./backend:/app
     expose:
       - "${BACKEND_PORT}"  # 不再对外暴露，用于 nginx 内部通信
+    restart: on-failure:3
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${BACKEND_PORT}/api/sys_health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    mem_limit: 4g
 
   frontend:
     container_name: bilinote-frontend
@@ -24,6 +35,8 @@ services:
       - .env
     expose:
       - "80"  # 不暴露给宿主机，只供 nginx 访问
+    restart: on-failure:3
+    mem_limit: 512m
 
   nginx:
     container_name: bilinote-nginx
@@ -33,5 +46,9 @@ services:
     volumes:
       - ./nginx/default.conf:/etc/nginx/conf.d/default.conf
     depends_on:
-      - backend
-      - frontend
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+    restart: on-failure:3
+    mem_limit: 256m

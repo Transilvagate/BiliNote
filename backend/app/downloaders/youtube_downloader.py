@@ -9,6 +9,7 @@ from typing import Any, Dict, Union, Optional, List, Tuple
 import yt_dlp
 
 from app.downloaders.base import Downloader, DownloadQuality
+from app.downloaders.youtube_subtitle import YouTubeSubtitleFetcher
 from app.models.notes_model import AudioDownloadResult
 from app.models.transcriber_model import TranscriptResult, TranscriptSegment, SubtitleFetchResult
 from app.utils.path_helper import get_data_dir
@@ -27,12 +28,13 @@ class YoutubeDownloader(Downloader, ABC):
         video_url: str,
         output_dir: Union[str, None] = None,
         quality: DownloadQuality = "fast",
-        need_video:Optional[bool]=False
+        need_video: Optional[bool] = False,
+        skip_download: bool = False,
     ) -> AudioDownloadResult:
         if output_dir is None:
             output_dir = get_data_dir()
         if not output_dir:
-            output_dir=self.cache_data
+            output_dir = self.cache_data
         os.makedirs(output_dir, exist_ok=True)
 
         output_path = os.path.join(output_dir, "%(id)s.%(ext)s")
@@ -44,10 +46,13 @@ class YoutubeDownloader(Downloader, ABC):
             'quiet': False,
         }
 
+        if skip_download:
+            ydl_opts['skip_download'] = True
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=True)
+            info = ydl.extract_info(video_url, download=not skip_download)
             video_id = info.get("id")
-            ext = info.get("ext", "m4a")  # 兜底用 m4a
+            ext = info.get("ext", "m4a")
             audio_path = os.path.join(output_dir, f"{video_id}.{ext}")
 
         return AudioDownloadResult(
@@ -129,23 +134,31 @@ class YoutubeDownloader(Downloader, ABC):
     def download_subtitles(self, video_url: str, output_dir: str = None,
                            langs: List[str] = None) -> SubtitleFetchResult:
         """
-        尝试获取YouTube视频字幕（优先人工字幕，其次自动生成）
+        通过 YouTube InnerTube API 直接获取字幕（优先人工字幕，其次自动生成）。
+        比 yt_dlp 方式更轻量，无需写临时文件到磁盘。
 
         :param video_url: 视频链接
-        :param output_dir: 输出路径
+        :param output_dir: 未使用（保留接口兼容）
         :param langs: 优先语言列表
         :return: SubtitleFetchResult
         """
+        if langs is None:
+            langs = ['zh-Hans', 'zh', 'zh-CN', 'zh-TW', 'en', 'en-US', 'ja']
+
+        video_id = extract_video_id(video_url, "youtube")
         if output_dir is None:
             output_dir = get_data_dir()
         if not output_dir:
             output_dir = self.cache_data
         os.makedirs(output_dir, exist_ok=True)
 
-        if langs is None:
-            langs = ['zh-Hans', 'zh', 'zh-CN', 'zh-TW', 'en', 'en-US']
-
-        video_id = extract_video_id(video_url, "youtube")
+        fetcher = YouTubeSubtitleFetcher()
+        try:
+            fetch_result = fetcher.fetch_subtitles(video_id, langs)
+            if fetch_result and fetch_result.transcript and fetch_result.transcript.segments:
+                return fetch_result
+        except Exception as exc:
+            logger.warning(f"YouTube transcript-api 获取字幕失败，将回退 yt-dlp: {exc}")
 
         ydl_opts = {
             'writesubtitles': True,

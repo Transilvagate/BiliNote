@@ -35,9 +35,10 @@ from app.services.constant import SUPPORT_PLATFORM_MAP
 from app.services.provider import ProviderService
 from app.transcriber.base import Transcriber
 from app.transcriber.transcriber_provider import get_transcriber, _transcribers
-from app.utils.note_helper import replace_content_markers
-from app.utils.task_assets import get_task_assets_dir, get_task_note_path
 from app.utils.formal_transcript import sanitize_formal_transcript_body
+from app.utils.note_helper import replace_content_markers, prepend_source_link
+from app.utils.screenshot_marker import extract_screenshot_timestamps
+from app.utils.task_assets import get_task_assets_dir, get_task_note_path
 from app.utils.video_helper import generate_screenshot
 from app.utils.video_reader import VideoReader
 
@@ -87,9 +88,11 @@ class NoteGenerator:
     """
 
     def __init__(self):
-        self.model_size: str = "base"
+        from app.services.transcriber_config_manager import TranscriberConfigManager
+        config_manager = TranscriberConfigManager()
+        self.model_size: str = config_manager.get_whisper_model_size()
         self.device: Optional[str] = None
-        self.transcriber_type: str = os.getenv("TRANSCRIBER_TYPE", "fast-whisper")
+        self.transcriber_type: str = config_manager.get_transcriber_type()
         self.transcriber: Optional[Transcriber] = None
         self.video_path: Optional[Path] = None
         self.video_img_urls=[]
@@ -267,6 +270,8 @@ class NoteGenerator:
                     platform=platform,
                     task_id=task_id,
                 )
+
+            markdown = prepend_source_link(markdown, str(video_url))
 
             # 5. 同步写入每任务目录中的 note.md
             self._update_status(
@@ -677,7 +682,6 @@ class NoteGenerator:
                 output_dir=output_path,
                 need_video=need_video,
             )
-            # 缓存 audio 元信息到本地 JSON
             audio_cache_file.write_text(json.dumps(asdict(audio), ensure_ascii=False, indent=2), encoding="utf-8")
             logger.info(f"音频下载并缓存成功 ({audio_cache_file})")
             self._update_status(
@@ -1123,6 +1127,7 @@ class NoteGenerator:
             style=style,
             extras=extras,
             formal_transcript_style=formal_transcript_style,
+            checkpoint_key=task_id,
         )
 
         try:
@@ -1646,14 +1651,7 @@ class NoteGenerator:
         :param markdown: 原始 Markdown 文本
         :return: 标记与对应时间戳秒数的列表
         """
-        pattern = r"(?:\*Screenshot-(\d{2}):(\d{2})|Screenshot-\[(\d{2}):(\d{2})\])"
-        results: List[Tuple[str, int]] = []
-        for match in re.finditer(pattern, markdown):
-            mm = match.group(1) or match.group(3)
-            ss = match.group(2) or match.group(4)
-            total_seconds = int(mm) * 60 + int(ss)
-            results.append((match.group(0), total_seconds))
-        return results
+        return extract_screenshot_timestamps(markdown)
 
     def _save_metadata(self, video_id: str, platform: str, task_id: str) -> None:
         """

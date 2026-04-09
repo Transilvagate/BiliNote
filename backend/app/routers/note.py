@@ -21,6 +21,7 @@ from app.enmus.task_status_enums import TaskStatus
 from app.exceptions.note import NoteError
 from app.services.markdown_bundle_export import MarkdownBundleExporter
 from app.services.note import NoteGenerator, logger
+from app.services.task_serial_executor import task_serial_executor
 from app.utils.response import ResponseWrapper as R
 from app.utils.task_assets import get_task_assets_dir, safe_join_under
 from app.utils.url_parser import extract_video_id
@@ -102,31 +103,41 @@ def run_note_task(task_id: str, video_url: str, platform: str, quality: Download
     if not model_name or not provider_id:
         raise HTTPException(status_code=400, detail="请选择模型和提供者")
 
-    note = NoteGenerator().generate(
-        video_url=video_url,
-        platform=platform,
-        quality=quality,
-        task_id=task_id,
-        model_name=model_name,
-        provider_id=provider_id,
-        link=link,
-        _format=_format,
-        style=style,
-        extras=extras,
-        formal_transcript_style=formal_transcript_style,
-        transcript_source=transcript_source,
-        screenshot=screenshot
-        , video_understanding=video_understanding,
-        video_interval=video_interval,
-        grid_size=grid_size,
-        force_refresh_transcript=force_refresh_transcript,
-    )
+    def _execute_note_task():
+        return NoteGenerator().generate(
+            video_url=video_url,
+            platform=platform,
+            quality=quality,
+            task_id=task_id,
+            model_name=model_name,
+            provider_id=provider_id,
+            link=link,
+            _format=_format,
+            style=style,
+            extras=extras,
+            formal_transcript_style=formal_transcript_style,
+            transcript_source=transcript_source,
+            screenshot=screenshot,
+            video_understanding=video_understanding,
+            video_interval=video_interval,
+            grid_size=grid_size,
+            force_refresh_transcript=force_refresh_transcript,
+        )
+
+    logger.info(f"任务进入执行队列 (task_id={task_id})")
+    note = task_serial_executor.run(_execute_note_task)
     logger.info(f"Note generated: {task_id}")
     if not note or not note.markdown:
         logger.warning(f"任务 {task_id} 执行失败，跳过保存")
         return
     save_note_to_file(task_id, note)
 
+    # 自动建立向量索引（用于 AI 问答），失败不影响笔记生成
+    try:
+        from app.services.vector_store import VectorStoreManager
+        VectorStoreManager().index_task(task_id)
+    except Exception as e:
+        logger.warning(f"向量索引失败（不影响笔记）: {e}")
 
 
 @router.post('/delete_task')

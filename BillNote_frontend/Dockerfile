@@ -11,22 +11,17 @@ ENV COREPACK_NPM_REGISTRY=https://registry.npmmirror.com
 RUN npm config set registry https://registry.npmmirror.com && \
     corepack enable && corepack prepare pnpm@9.15.5 --activate
 
-# 设置工作目录
 WORKDIR /app
 
-# 拷贝前端源码
-COPY ./BillNote_frontend /app
-
-# 安装依赖并构建（指定国内 registry）
-RUN pnpm install --no-frozen-lockfile --registry https://registry.npmmirror.com && pnpm run build
+COPY ./BillNote_frontend/ ./
+RUN pnpm install --no-frozen-lockfile --registry https://registry.npmmirror.com && \
+    pnpm run build
 
 # --- 阶段2：使用 nginx 作为静态服务器 ---
 FROM ${NGINX_BASE_IMAGE}
 
-# 删除默认配置（可选）
 RUN rm -rf /etc/nginx/conf.d/default.conf
 COPY ./BillNote_frontend/deploy/default.conf /etc/nginx/conf.d/default.conf
-
 
 # 拷贝构建产物
 COPY --from=builder /app/dist /usr/share/nginx/html
