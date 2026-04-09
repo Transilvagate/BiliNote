@@ -55,6 +55,7 @@ class VideoRequest(BaseModel):
         "lead_plus_support",
         "multi_dialogue",
     ] = "auto"
+    transcript_source: Literal["auto", "bbdown", "asr"] = "auto"
     video_understanding: Optional[bool] = False
     video_interval: Optional[int] = 0
     grid_size: Optional[list] = []
@@ -91,6 +92,7 @@ def save_note_to_file(task_id: str, note):
 def run_note_task(task_id: str, video_url: str, platform: str, quality: DownloadQuality,
                   link: bool = False, screenshot: bool = False, model_name: str = None, provider_id: str = None,
                   _format: list = None, style: str = None, extras: str = None, formal_transcript_style: str = "auto",
+                  transcript_source: str = "auto",
                   video_understanding: bool = False,
                   video_interval=0, grid_size=None, force_refresh_transcript: bool = False
                   ):
@@ -112,6 +114,7 @@ def run_note_task(task_id: str, video_url: str, platform: str, quality: Download
         style=style,
         extras=extras,
         formal_transcript_style=formal_transcript_style,
+        transcript_source=transcript_source,
         screenshot=screenshot
         , video_understanding=video_understanding,
         video_interval=video_interval,
@@ -194,7 +197,7 @@ def generate_note(data: VideoRequest, background_tasks: BackgroundTasks):
 
         background_tasks.add_task(run_note_task, task_id, data.video_url, data.platform, data.quality, data.link,
                                   data.screenshot, data.model_name, data.provider_id, data.format, data.style,
-                                  data.extras, data.formal_transcript_style,
+                                  data.extras, data.formal_transcript_style, data.transcript_source,
                                   data.video_understanding, data.video_interval, data.grid_size,
                                   force_refresh_transcript)
         return R.success({"task_id": task_id})

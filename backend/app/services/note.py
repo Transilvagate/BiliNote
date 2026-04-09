@@ -112,6 +112,7 @@ class NoteGenerator:
         style: Optional[str] = None,
         extras: Optional[str] = None,
         formal_transcript_style: str = "auto",
+        transcript_source: str = "auto",
         output_path: Optional[str] = None,
         video_understanding: bool = False,
         video_interval: int = 0,
@@ -169,20 +170,33 @@ class NoteGenerator:
             audio_cache_file = NOTE_OUTPUT_DIR / f"{task_id}_audio.json"
             transcript_cache_file = NOTE_OUTPUT_DIR / f"{task_id}_transcript.json"
             markdown_cache_file = NOTE_OUTPUT_DIR / f"{task_id}_markdown.md"
-            # 1. 先尝试平台字幕（命中则跳过音频下载）
-            transcript = self._get_transcript(
-                downloader=downloader,
-                video_url=video_url,
-                audio_file=None,
-                transcript_cache_file=transcript_cache_file,
-                status_phase=TaskStatus.TRANSCRIBING,
-                task_id=task_id,
-                platform=platform,
-                force_refresh=force_refresh_transcript,
-                allow_asr_fallback=False,
-            )
 
-            # 2. 根据字幕命中情况决定是否下载音频
+            # 1. 根据 transcript_source 决定是否尝试平台字幕
+            if transcript_source == "asr":
+                # 强制本地转写，跳过平台字幕
+                self._update_status(
+                    task_id,
+                    TaskStatus.TRANSCRIBING,
+                    message="获取字幕/转写",
+                    detail="已选择本地模型转写，跳过平台字幕下载",
+                    source="system",
+                )
+                transcript = None
+            else:
+                # "auto" 或 "bbdown"：先尝试平台字幕（命中则跳过音频下载）
+                transcript = self._get_transcript(
+                    downloader=downloader,
+                    video_url=video_url,
+                    audio_file=None,
+                    transcript_cache_file=transcript_cache_file,
+                    status_phase=TaskStatus.TRANSCRIBING,
+                    task_id=task_id,
+                    platform=platform,
+                    force_refresh=force_refresh_transcript,
+                    allow_asr_fallback=False,
+                )
+
+            # 2. 根据字幕命中情况决定是否下载音频并转写
             if transcript is None:
                 audio_meta = self._download_media(
                     downloader=downloader,

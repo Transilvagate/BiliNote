@@ -36,7 +36,7 @@ import {
 } from '@/components/ui/select.tsx'
 import { Input } from '@/components/ui/input.tsx'
 import { Textarea } from '@/components/ui/textarea.tsx'
-import { formalTranscriptStyles, noteStyles, noteFormats, videoPlatforms } from '@/constant/note.ts'
+import { formalTranscriptStyles, noteStyles, noteFormats, videoPlatforms, transcriptSources } from '@/constant/note.ts'
 import { fetchModels } from '@/services/model.ts'
 import { useNavigate } from 'react-router-dom'
 
@@ -55,6 +55,7 @@ const formSchema = z
       .enum(['auto', 'single_narration', 'lead_plus_support', 'multi_dialogue'])
       .default('auto'),
     extras: z.string().optional(),
+    transcript_source: z.enum(['auto', 'bbdown', 'asr']).default('auto'),
     video_understanding: z.boolean().optional(),
     video_interval: z.coerce.number().min(1).max(30).default(4).optional(),
     grid_size: z
@@ -148,6 +149,7 @@ const NoteForm = () => {
       model_name: modelList[0]?.model_name || '',
       style: 'minimal',
       formal_transcript_style: 'auto',
+      transcript_source: 'auto',
       video_interval: 4,
       grid_size: [3, 3],
       format: [],
@@ -184,6 +186,7 @@ const NoteForm = () => {
       formal_transcript_style: formData.formal_transcript_style || 'auto',
       quality: formData.quality || 'medium',
       extras: formData.extras || '',
+      transcript_source: formData.transcript_source || 'auto',
       screenshot: formData.screenshot ?? false,
       link: formData.link ?? false,
       video_understanding: formData.video_understanding ?? false,
@@ -380,9 +383,47 @@ const NoteForm = () => {
               </FormItem>
             )}
           />
+
+          {/* 字幕来源 — 本地视频无平台字幕，不显示 */}
+          {platform !== 'local' && (
+            <FormField
+              control={form.control}
+              name="transcript_source"
+              render={({ field }) => (
+                <FormItem>
+                  <SectionHeader
+                    title="字幕来源"
+                    tip="选择本次获取文字稿的方式：优先字幕、仅平台字幕（BBDown）或强制本地语音转写"
+                  />
+                  <Select value={field.value} onValueChange={field.onChange} defaultValue={field.value}>
+                    <FormControl>
+                      <SelectTrigger className="w-full min-w-0 truncate">
+                        <SelectValue />
+                      </SelectTrigger>
+                    </FormControl>
+                    <SelectContent>
+                      {transcriptSources.map(({ label, value, description }) => (
+                        <SelectItem key={value} value={value}>
+                          <TooltipProvider>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <span>{label}</span>
+                              </TooltipTrigger>
+                              <TooltipContent className="text-xs max-w-xs">{description}</TooltipContent>
+                            </Tooltip>
+                          </TooltipProvider>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          )}
+
           <div className="grid grid-cols-2 gap-2">
-            {/* 模型选择 */}
-            {
+            {/* 模型选择 */}            {
 
              modelList.length>0?(     <FormField
                className="w-full"

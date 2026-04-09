@@ -1,6 +1,8 @@
 FROM m.daocloud.io/docker.io/nvidia/cuda:12.8.0-cudnn-runtime-ubuntu22.04
 
-ARG BBDOWN_DOWNLOAD_URL=https://github.com/nilaoda/BBDown/releases/download/1.6.3/BBDown_1.6.3_20240814_linux-x64.zip
+# BBDown 下载地址：使用 ghfast.top 代理访问 GitHub Release
+# 若代理不可用可在构建时覆盖：--build-arg BBDOWN_DOWNLOAD_URL=<url>
+ARG BBDOWN_DOWNLOAD_URL=https://ghfast.top/https://github.com/nilaoda/BBDown/releases/download/1.6.3/BBDown_1.6.3_20240814_linux-x64.zip
 
 # 替换为清华 Ubuntu 22.04 (jammy) 镜像源
 RUN sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' /etc/apt/sources.list && \
@@ -37,10 +39,10 @@ COPY ./backend /app
 # 安装项目依赖（不含 torch）
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 
-# 安装 CUDA 版 torch（cu124 wheel 向后兼容 CUDA 12.8 runtime）
+# 安装 CUDA 版 torch（使用上海交大 PyTorch wheel 镜像，cu124 兼容 CUDA 12.8 runtime）
 # 必须在 transformers 之前安装，否则 pip 会拉取 CPU 版 torch
 RUN pip install --no-cache-dir torch \
-    --extra-index-url https://download.pytorch.org/whl/cu124
+    --index-url https://mirror.sjtu.edu.cn/pytorch-wheels/cu124/
 
 # 升级 ctranslate2 至 4.7.1+（修复 Blackwell sm_120 上的 CUDA kernel 崩溃问题）
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple 'ctranslate2>=4.7.1'

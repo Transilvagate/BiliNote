@@ -48,6 +48,7 @@ export const generateNote = async (data: {
   format: Array<string>
   style: string
   formal_transcript_style?: 'auto' | 'single_narration' | 'lead_plus_support' | 'multi_dialogue'
+  transcript_source?: 'auto' | 'bbdown' | 'asr'
   extras?: string
   video_understanding?: boolean
   video_interval?: number

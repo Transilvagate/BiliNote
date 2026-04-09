@@ -41,3 +41,9 @@ export const videoPlatforms = [
   { label: '快手', value: 'kuaishou', logo: KuaishouLogo },
   { label: '本地视频', value: 'local', logo: LocalLogo },
 ] as const
+
+export const transcriptSources = [
+  { label: '自动（优先字幕）', value: 'auto', description: '优先使用平台字幕，失败时自动回退本地语音转写' },
+  { label: 'BBDown 字幕', value: 'bbdown', description: '仅使用 BBDown / 平台字幕，不进行本地语音转写' },
+  { label: '本地模型转写', value: 'asr', description: '跳过字幕下载，直接使用本地语音识别模型转写' },
+] as const

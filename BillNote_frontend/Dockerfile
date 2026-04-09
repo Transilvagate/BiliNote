@@ -5,7 +5,11 @@ ARG NGINX_BASE_IMAGE=m.daocloud.io/docker.io/library/nginx:1.25-alpine
 FROM ${NODE_BASE_IMAGE} AS builder
 
 # 使用 pnpm v9，规避 pnpm v10 在容器内默认拦截依赖构建脚本导致的构建失败
-RUN corepack enable && corepack prepare pnpm@9.15.5 --activate
+# 配置 npm 使用国内镜像源，确保 corepack 拉取 pnpm 及后续依赖安装均走国内镜像
+# COREPACK_NPM_REGISTRY 控制 corepack 下载 pnpm 二进制时使用的 registry
+ENV COREPACK_NPM_REGISTRY=https://registry.npmmirror.com
+RUN npm config set registry https://registry.npmmirror.com && \
+    corepack enable && corepack prepare pnpm@9.15.5 --activate
 
 # 设置工作目录
 WORKDIR /app
@@ -13,8 +17,8 @@ WORKDIR /app
 # 拷贝前端源码
 COPY ./BillNote_frontend /app
 
-# 安装依赖并构建
-RUN pnpm install --no-frozen-lockfile && pnpm run build
+# 安装依赖并构建（指定国内 registry）
+RUN pnpm install --no-frozen-lockfile --registry https://registry.npmmirror.com && pnpm run build
 
 # --- 阶段2：使用 nginx 作为静态服务器 ---
 FROM ${NGINX_BASE_IMAGE}
