@@ -24,7 +24,7 @@ from app.services.note import NoteGenerator, logger
 from app.services.task_serial_executor import task_serial_executor
 from app.utils.response import ResponseWrapper as R
 from app.utils.task_assets import get_task_assets_dir, safe_join_under
-from app.utils.url_parser import extract_video_id
+from app.utils.url_parser import extract_video_id, normalize_bilibili_url
 from app.validators.video_url_validator import is_supported_video_url
 
 # from app.services.downloader import download_raw_audio
@@ -165,8 +165,11 @@ async def upload(file: UploadFile = File(...)):
 @router.post("/generate_note")
 def generate_note(data: VideoRequest, background_tasks: BackgroundTasks):
     try:
+        video_url = data.video_url
+        if str(data.platform).strip().lower() == "bilibili":
+            video_url = normalize_bilibili_url(data.video_url).normalized_url
 
-        video_id = extract_video_id(data.video_url, data.platform)
+        video_id = extract_video_id(video_url, data.platform)
         # if not video_id:
         #     raise HTTPException(status_code=400, detail="无法提取视频 ID")
         # existing = get_task_by_video(video_id, data.platform)
@@ -206,12 +209,14 @@ def generate_note(data: VideoRequest, background_tasks: BackgroundTasks):
                 diagnostics={"force_refresh_transcript": force_refresh_transcript},
             )
 
-        background_tasks.add_task(run_note_task, task_id, data.video_url, data.platform, data.quality, data.link,
+        background_tasks.add_task(run_note_task, task_id, video_url, data.platform, data.quality, data.link,
                                   data.screenshot, data.model_name, data.provider_id, data.format, data.style,
                                   data.extras, data.formal_transcript_style, data.transcript_source,
                                   data.video_understanding, data.video_interval, data.grid_size,
                                   force_refresh_transcript)
         return R.success({"task_id": task_id})
+    except NoteError as exc:
+        return R.error(code=exc.code, msg=exc.message)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

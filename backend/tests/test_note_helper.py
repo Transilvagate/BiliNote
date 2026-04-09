@@ -30,6 +30,20 @@ class TestNoteHelper(unittest.TestCase):
 
         self.assertEqual(result, markdown)
 
+    def test_replace_content_markers_uses_bilibili_timestamp_query(self):
+        markdown = "请看 Content-04:16"
+
+        result = note_helper.replace_content_markers(markdown, "BV1xx411c7mD", "bilibili")
+
+        self.assertIn("(https://www.bilibili.com/video/BV1xx411c7mD?t=256)", result)
+
+    def test_replace_content_markers_uses_bilibili_page_and_timestamp_query(self):
+        markdown = "请看 Content-04:16"
+
+        result = note_helper.replace_content_markers(markdown, "BV1xx411c7mD_p4", "bilibili")
+
+        self.assertIn("(https://www.bilibili.com/video/BV1xx411c7mD?p=4&t=256)", result)
+
 
 if __name__ == "__main__":
     unittest.main()

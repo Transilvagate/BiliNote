@@ -15,6 +15,7 @@ class ProviderErrorEnum(enum.Enum):
 
 class NoteErrorEnum(enum.Enum):
     PLATFORM_NOT_SUPPORTED = (300101 ,"选择的平台不受支持")
+    BILIBILI_COLLECTION_NEEDS_EPISODE = (300102, "这是合集主页，请打开具体某一集后复制视频页链接")
 
     def __init__(self, code, message):
         self.code = code

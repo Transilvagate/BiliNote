@@ -1,6 +1,16 @@
 import re
 
 
+def _split_bilibili_video_id(video_id: str) -> tuple[str, int | None]:
+    raw_value = (video_id or "").strip()
+    match = re.match(r"^(BV[0-9A-Za-z]+|av\d+)_p(\d+)$", raw_value, re.IGNORECASE)
+    if not match:
+        return raw_value, None
+    base_video_id = match.group(1)
+    page = int(match.group(2))
+    return base_video_id, page if page > 0 else None
+
+
 def prepend_source_link(markdown: str | None, source_url: str) -> str | None:
     """
     在笔记开头添加来源链接；若首个非空行已包含来源链接，则更新该行并避免重复。
@@ -46,10 +56,13 @@ def replace_content_markers(markdown: str, video_id: str, platform: str = 'bilib
         total_seconds = int(mm) * 60 + int(ss)
 
         if platform == 'bilibili':
-            video_id = video_id.replace("_p", "?p=")
-            url = f"https://www.bilibili.com/video/{video_id}&t={total_seconds}"
-            parsed_video_id = safe_video_id.replace("_p", "?p=")
-            url = f"https://www.bilibili.com/video/{parsed_video_id}&t={total_seconds}"
+            parsed_video_id, page = _split_bilibili_video_id(safe_video_id)
+            query_parts = []
+            if page:
+                query_parts.append(f"p={page}")
+            query_parts.append(f"t={total_seconds}")
+            query = "&".join(query_parts)
+            url = f"https://www.bilibili.com/video/{parsed_video_id}?{query}"
         elif platform == 'youtube':
             url = f"https://www.youtube.com/watch?v={video_id}&t={total_seconds}s"
             url = f"https://www.youtube.com/watch?v={safe_video_id}&t={total_seconds}s"

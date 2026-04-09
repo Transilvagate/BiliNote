@@ -14,7 +14,7 @@ from app.models.transcriber_model import TranscriptResult, TranscriptSegment, Su
 from app.services.bbdown_client import BBDownClient
 from app.services.bilibili_cookie_service import BilibiliCookieService
 from app.utils.path_helper import get_data_dir
-from app.utils.url_parser import extract_video_id
+from app.utils.url_parser import extract_video_id, normalize_bilibili_url
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,10 @@ class BilibiliDownloader(Downloader, ABC):
             output_dir = self.cache_data
         os.makedirs(output_dir, exist_ok=True)
         return output_dir
+
+    @staticmethod
+    def _normalize_video_url(video_url: str) -> str:
+        return normalize_bilibili_url(video_url).normalized_url
 
     def _apply_cookie_file(
         self,
@@ -78,6 +82,7 @@ class BilibiliDownloader(Downloader, ABC):
         quality: DownloadQuality = "fast",
         need_video: Optional[bool] = False
     ) -> AudioDownloadResult:
+        video_url = self._normalize_video_url(video_url)
         output_dir = self._resolve_output_dir(output_dir)
 
         output_path = os.path.join(output_dir, "%(id)s.%(ext)s")
@@ -102,6 +107,7 @@ class BilibiliDownloader(Downloader, ABC):
         return self._build_audio_result_from_info(info, output_dir=output_dir, ext="mp3")
 
     def get_media_info(self, video_url: str, output_dir: str = None) -> Optional[AudioDownloadResult]:
+        video_url = self._normalize_video_url(video_url)
         output_dir = self._resolve_output_dir(output_dir)
         ydl_opts: Dict[str, Any] = {
             "skip_download": True,
@@ -125,12 +131,16 @@ class BilibiliDownloader(Downloader, ABC):
         """
         下载视频，返回视频文件路径
         """
+        video_url = self._normalize_video_url(video_url)
 
         output_dir = self._resolve_output_dir(output_dir)
         video_id = extract_video_id(video_url, "bilibili")
-        video_path = os.path.join(output_dir, f"{video_id}.mp4")
-        if os.path.exists(video_path):
-            return video_path
+        if video_id:
+            video_path = os.path.join(output_dir, f"{video_id}.mp4")
+            if os.path.exists(video_path):
+                return video_path
+        else:
+            video_path = ""
 
         output_path = os.path.join(output_dir, "%(id)s.%(ext)s")
 
@@ -173,6 +183,7 @@ class BilibiliDownloader(Downloader, ABC):
         :param langs: 优先语言列表
         :return: SubtitleFetchResult
         """
+        video_url = self._normalize_video_url(video_url)
         output_dir = self._resolve_output_dir(output_dir)
         if langs is None:
             langs = ["zh-Hans", "zh-CN", "zh-TW", "zh", "ai-zh"]

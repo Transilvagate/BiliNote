@@ -1,9 +1,9 @@
-from pydantic import AnyUrl, validator, BaseModel, field_validator
+from pydantic import AnyUrl, BaseModel, field_validator
 import re
-from urllib.parse import urlparse
+
+from app.utils.url_parser import is_supported_bilibili_url
 
 SUPPORTED_PLATFORMS = {
-    "bilibili": r"(https?://)?(www\.)?bilibili\.com/video/[a-zA-Z0-9]+",
     "youtube": r"(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/)[\w\-]+",
     "douyin": "douyin",
     "kuaishou": "kuaishou"
@@ -11,13 +11,10 @@ SUPPORTED_PLATFORMS = {
 
 
 def is_supported_video_url(url: str) -> bool:
-    parsed = urlparse(url)
-
-    # 检查是否为Bilibili的短链接
-    if parsed.netloc == "b23.tv":
+    if is_supported_bilibili_url(url):
         return True
 
-    for name, pattern in SUPPORTED_PLATFORMS.items():
+    for _, pattern in SUPPORTED_PLATFORMS.items():
         if pattern in ["douyin", "kuaishou"]:
             if pattern in url:
                 return True
